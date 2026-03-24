@@ -19,42 +19,108 @@ class Client
 
     static void Main(string[] args)
     {
-        //tu mozesz przetestiwac te funkcje dobierania par, dziala z tego co widze
-       /* Console.WriteLine("Testuje generowanie par...");
-        var paryTest = GenerujPary(new List<string> { "a.txt", "b.txt", "c.txt" });
-        Console.WriteLine("Wygenerowane pary:");
-        foreach (var (a, b) in paryTest)
-        {
-            Console.WriteLine($"{a} vs {b}");
-        }
-        */
-        // na razie wpisujemy teksty z klawiatury
-        Console.WriteLine("Wpisz pierwszy tekst i nacisnij Enter:");
+        List<string> posortowane = WczytajIposortuj(PobierzSciezkiOdUzytkownika());
+        List<(string, string)> pary = GenerujPary(posortowane);
+        WyswietlPary(pary);
+
+        //pobieranie dwoch tekstwo i wyslanie do serwera
+        Console.WriteLine("Wpisz tekst 1:");
         string tekst1 = Console.ReadLine();
 
-        Console.WriteLine("Wpisz drugi tekst i nacisnij Enter:");
+        Console.WriteLine("Wpisz tekst 2:");
         string tekst2 = Console.ReadLine();
 
-        // wysylamy do serwera i odbieramy wynik
         WyslijTeksty(adresySerwera[0], tekst1, tekst2);
-        Koniec();
 
         // pozniej tutaj bedzie:
-        // List<string> pliki = WczytajIposortuj(args);
-        // List<(string, string)> pary = GenerujPary(pliki);
-        // List<(string, string, double)> wyniki = RozdzielZadania(pary, pliki);
-        // WyswietlMacierz(wyniki, pliki);
+        // List<(string, string, double)> wyniki = RozdzielZadania(pary, posortowane);
+        // WyswietlMacierz(wyniki, posortowane);
+    }
+
+    // pyta uzytkownika o sciezki do plikow
+    // konczy gdy uzytkownik wcisnnie pusty Enter
+    static string[] PobierzSciezkiOdUzytkownika()
+    {
+        Console.WriteLine("Podaj sciezki do plikow (pusty Enter aby zakonczyc):");
+        List<string> sciezki = new List<string>();
+
+        while (true)
+        {
+            string linia = Console.ReadLine();
+            if (linia == "") break;
+            sciezki.Add(linia);
+        }
+
+        if (sciezki.Count < 2)
+        {
+            Console.WriteLine("Podaj co najmniej dwa pliki!");
+            return new string[0];
+        }
+
+        return sciezki.ToArray();
+    }
+
+    // wczytuje pliki i sortuje malejaco wg rozmiaru
+    static List<string> WczytajIposortuj(string[] args)
+    {
+        List<string> pliki = new List<string>();
+
+        foreach (string sciezka in args)
+        {
+            if (!File.Exists(sciezka))
+            {
+                Console.WriteLine("Nie ma takiego pliku: " + sciezka);
+                continue;
+            }
+            pliki.Add(sciezka);
+        }
+
+        // sortujemy malejaco - najwieksze pliki pierwsze
+        pliki.Sort((a, b) => new FileInfo(b).Length.CompareTo(new FileInfo(a).Length));
+
+        Console.WriteLine("\n=== PLIKI PO POSORTOWANIU ===");
+        foreach (string plik in pliki)
+        {
+            long rozmiar = new FileInfo(plik).Length;
+            Console.WriteLine(Path.GetFileName(plik) + " - " + rozmiar + " bajtow");
+        }
+
+        return pliki;
+    }
+
+    // generuje liste wszystkich unikalnych par plikow
+    static List<(string, string)> GenerujPary(List<string> pliki)
+    {
+        List<(string, string)> pary = new List<(string, string)>();
+
+        // podwojna petla - kazda para tylko raz
+        for (int i = 0; i < pliki.Count; i++)
+        {
+            for (int j = i + 1; j < pliki.Count; j++)
+            {
+                pary.Add((pliki[i], pliki[j]));
+            }
+        }
+
+        return pary;
+    }
+
+    // wyswietla wygenerowane pary z rozmiarami plikow
+    static void WyswietlPary(List<(string, string)> pary)
+    {
+        Console.WriteLine("\n=== PARY DO POROWNANIA ===");
+        foreach (var (a, b) in pary)
+        {
+            long rozmiarA = new FileInfo(a).Length;
+            long rozmiarB = new FileInfo(b).Length;
+            Console.WriteLine(Path.GetFileName(a) + " (" + rozmiarA + " B) vs "
+                            + Path.GetFileName(b) + " (" + rozmiarB + " B)");
+        }
+        Console.WriteLine("Lacznie par: " + pary.Count);
     }
 
     // na razie wysyla dwa teksty i odbiera liczbe slow
     // pozniej zastapiona przez WyslijZadanie()
-
-    static void Koniec()//Pomyślałem ze dodam takie cos co wrzucimy na koncu poki co, bo jak klient dostaje odpowiedz to znika konsola, wiec
-        //poki co zeby mozna bylo zobacz wynikiXD pozdro
-    {
-        Console.WriteLine("Naciśnij dowolny klawisz, aby zakończyć...");
-        Console.ReadKey(); // czeka aż użytkownik wciśnie **dowolny klawisz**
-    }
     static void WyslijTeksty(string adres, string tekst1, string tekst2)
     {
         try
@@ -108,56 +174,12 @@ class Client
         writer.Write(dane);
     }
 
-    // sprawdzic czy kazdy plik istnieje
-    // posortowac po File.ReadAllBytes(p).Length malejaco
-    // wczytuje pliki podane jako argumenty i sortuje wg rozmiaru
-    static List<string> WczytajIposortuj(string[] args)
-    {
-        List<string> istniejącePliki = new List<string>();
-
-        foreach (string sciezka in args)
-        {
-            if (File.Exists(sciezka))
-            {
-                istniejącePliki.Add(sciezka);
-            }
-            else
-            {
-                Console.WriteLine("[OSTRZEŻENIE] Plik nie istnieje: " + sciezka);
-            }
-        }
-
-        istniejącePliki.Sort((a, b) =>
-        {
-            long rozmiarA = new FileInfo(a).Length;
-            long rozmiarB = new FileInfo(b).Length;
-            return rozmiarB.CompareTo(rozmiarA); // malejąco
-        });
-
-        return istniejącePliki;
-    }
-    //generuje liste wszystkich unikalnych par plikow
-    static List<(string, string)> GenerujPary(List<string> pliki)
-    {
-        List<(string, string)> pary = new List<(string, string)>();
-
-        for (int i = 0; i < pliki.Count; i++)
-        {
-            for (int j = i + 1; j < pliki.Count; j++)
-            {
-                pary.Add((pliki[i], pliki[j]));
-            }
-        }
-
-        return pary;
-    }
-
     // rozdziela pary miedzy dostepne serwery
     static List<(string, string, double)> RozdzielZadania(List<(string, string)> pary, List<string> pliki)
     {
         // TODO: podzielic pary na paczki wg grainSize
         // TODO: przydzielic paczki do serwerow round-robin
-        // TODO: wyslac zadania wspolbieznie
+        // TODO: wyslac zadania wspolbieznie za pomoca ConcurrentQueue
         // TODO: zebrac wyniki i zwrocic
         return new List<(string, string, double)>();
     }
