@@ -19,6 +19,15 @@ class Client
 
     static void Main(string[] args)
     {
+        //tu mozesz przetestiwac te funkcje dobierania par, dziala z tego co widze
+       /* Console.WriteLine("Testuje generowanie par...");
+        var paryTest = GenerujPary(new List<string> { "a.txt", "b.txt", "c.txt" });
+        Console.WriteLine("Wygenerowane pary:");
+        foreach (var (a, b) in paryTest)
+        {
+            Console.WriteLine($"{a} vs {b}");
+        }
+        */
         // na razie wpisujemy teksty z klawiatury
         Console.WriteLine("Wpisz pierwszy tekst i nacisnij Enter:");
         string tekst1 = Console.ReadLine();
@@ -28,6 +37,7 @@ class Client
 
         // wysylamy do serwera i odbieramy wynik
         WyslijTeksty(adresySerwera[0], tekst1, tekst2);
+        Koniec();
 
         // pozniej tutaj bedzie:
         // List<string> pliki = WczytajIposortuj(args);
@@ -38,6 +48,13 @@ class Client
 
     // na razie wysyla dwa teksty i odbiera liczbe slow
     // pozniej zastapiona przez WyslijZadanie()
+
+    static void Koniec()//Pomyślałem ze dodam takie cos co wrzucimy na koncu poki co, bo jak klient dostaje odpowiedz to znika konsola, wiec
+        //poki co zeby mozna bylo zobacz wynikiXD pozdro
+    {
+        Console.WriteLine("Naciśnij dowolny klawisz, aby zakończyć...");
+        Console.ReadKey(); // czeka aż użytkownik wciśnie **dowolny klawisz**
+    }
     static void WyslijTeksty(string adres, string tekst1, string tekst2)
     {
         try
@@ -91,8 +108,8 @@ class Client
         writer.Write(dane);
     }
 
-    // DONE: sprawdzic czy kazdy plik istnieje
-    // DONE: posortowac po File.ReadAllBytes(p).Length malejaco
+    // sprawdzic czy kazdy plik istnieje
+    // posortowac po File.ReadAllBytes(p).Length malejaco
     // wczytuje pliki podane jako argumenty i sortuje wg rozmiaru
     static List<string> WczytajIposortuj(string[] args)
     {
@@ -119,12 +136,20 @@ class Client
 
         return istniejącePliki;
     }
-
-    // generuje liste wszystkich unikalnych par plikow
+    //generuje liste wszystkich unikalnych par plikow
     static List<(string, string)> GenerujPary(List<string> pliki)
     {
-        // TODO: podwona petla for i<j zeby nie powtarzac par
-        return new List<(string, string)>();
+        List<(string, string)> pary = new List<(string, string)>();
+
+        for (int i = 0; i < pliki.Count; i++)
+        {
+            for (int j = i + 1; j < pliki.Count; j++)
+            {
+                pary.Add((pliki[i], pliki[j]));
+            }
+        }
+
+        return pary;
     }
 
     // rozdziela pary miedzy dostepne serwery
