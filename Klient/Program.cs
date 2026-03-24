@@ -91,12 +91,33 @@ class Client
         writer.Write(dane);
     }
 
+    // DONE: sprawdzic czy kazdy plik istnieje
+    // DONE: posortowac po File.ReadAllBytes(p).Length malejaco
     // wczytuje pliki podane jako argumenty i sortuje wg rozmiaru
     static List<string> WczytajIposortuj(string[] args)
     {
-        // TODO: sprawdzic czy kazdy plik istnieje
-        // TODO: posortowac po File.ReadAllBytes(p).Length malejaco
-        return new List<string>(args);
+        List<string> istniejącePliki = new List<string>();
+
+        foreach (string sciezka in args)
+        {
+            if (File.Exists(sciezka))
+            {
+                istniejącePliki.Add(sciezka);
+            }
+            else
+            {
+                Console.WriteLine("[OSTRZEŻENIE] Plik nie istnieje: " + sciezka);
+            }
+        }
+
+        istniejącePliki.Sort((a, b) =>
+        {
+            long rozmiarA = new FileInfo(a).Length;
+            long rozmiarB = new FileInfo(b).Length;
+            return rozmiarB.CompareTo(rozmiarA); // malejąco
+        });
+
+        return istniejącePliki;
     }
 
     // generuje liste wszystkich unikalnych par plikow
