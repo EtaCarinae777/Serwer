@@ -14,8 +14,15 @@ class Server
     {
         TcpListener serwer = new TcpListener(IPAddress.Any, port);
         serwer.Start();
-        Console.WriteLine("Serwer dziala na porcie " + port);
-
+        //testowalem sobie generowanie tych ngramow i dziala essa.
+        /*Console.WriteLine("Serwer dziala na porcie " + port);
+        string tekst = "Lorem ipsum dolor sit amet, consectetur adipiscing elit. Cras in pellentesque odio, eget vehicula tortor. Proin in hendrerit turpis. Sed sit amet porttitor nisl.";
+        HashSet<string> ngramy = GenerujNgramy(tekst, 4);
+        foreach (var ngram in ngramy)
+        {
+            Console.WriteLine("-" + ngram);
+        }
+        */
         while (true)
         {
             TcpClient klient = serwer.AcceptTcpClient();
@@ -60,6 +67,7 @@ class Server
         Console.WriteLine("[SERWER] Gotowe!");
 
         klient.Close();
+
     }
 
     // na razie liczy slowa, pozniej zastapiona przez PorownajPliki()
@@ -82,10 +90,23 @@ class Server
     // generuje zbior n-gramow dla podanego tekstu
     static HashSet<string> GenerujNgramy(string tekst, int n)
     {
-        // TODO: podzielic tekst na slowa
-        // TODO: przesuwac okno rozmiaru n po liscie slow
+        List<String> slowa = PodzielNaSlowa(tekst);
+        HashSet<string> ngramy = new HashSet<string>();
+
+        for (int i = 0; i <= slowa.Count - n; i++) 
+        {
+            string ngram = string.Join(" ", slowa.GetRange(i, n)); 
+            ngramy.Add(ngram);
+        }
         // TODO: kazdy n-gram dodac do HashSet
-        return new HashSet<string>();
+        return ngramy;
+    }
+    //dzielimy tekst na slowa
+    static List<string> PodzielNaSlowa(string tekst)
+    {
+        return tekst
+            .Split(new char[] { ' ', '\t', '\n', '\r' }, StringSplitOptions.RemoveEmptyEntries)
+            .ToList();
     }
 
     // oblicza wspolczynnik Jaccarda dla dwoch zbiorow n-gramow
