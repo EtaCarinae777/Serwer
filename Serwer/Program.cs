@@ -22,57 +22,19 @@ class Server
             TcpClient klient = serwer.AcceptTcpClient();
             Console.WriteLine("Nowe polaczenie od klienta");
             Task.Run(() => ObsluzKlienta(klient));
-
         }
-    }   
-
-    static void OdbierzTeksty(TcpClient klient)
-    {
-        NetworkStream stream = klient.GetStream();
-        BinaryReader reader = new BinaryReader(stream);
-        BinaryWriter writer = new BinaryWriter(stream);
-
-        Console.WriteLine("[SERWER] Czekam na parametry...");
-        int n = reader.ReadInt32();
-        int grainSize = reader.ReadInt32();
-        Console.WriteLine("[SERWER] Otrzymalem parametry: n=" + n + " grainSize=" + grainSize);
-        Thread.Sleep(1000);
-
-        Console.WriteLine("[SERWER] Czekam na tekst 1...");
-        string tekst1 = reader.ReadString();
-        Console.WriteLine("[SERWER] Otrzymalem tekst 1: " + tekst1);
-        Thread.Sleep(1500);
-
-        Console.WriteLine("[SERWER] Czekam na tekst 2...");
-        string tekst2 = reader.ReadString();
-        Console.WriteLine("[SERWER] Otrzymalem tekst 2: " + tekst2);
-        Thread.Sleep(2000);
-
-        Console.WriteLine("[SERWER] Licze slowa...");
-        Thread.Sleep(1000);
-        int iloscSlow1 = LiczSlowa(tekst1);
-        int iloscSlow2 = LiczSlowa(tekst2);
-
-        Console.WriteLine("[SERWER] Wyniki: tekst1=" + iloscSlow1 + " slow, tekst2=" + iloscSlow2 + " slow");
-        Thread.Sleep(500);
-
-        Console.WriteLine("[SERWER] Odsylam wyniki do klienta...");
-        writer.Write(iloscSlow1);
-        writer.Write(iloscSlow2);
-        Console.WriteLine("[SERWER] Gotowe!");
-
-        klient.Close();
-
     }
-    static string OdbierzPlik(BinaryReader reader)
+
+    static (string nazwa, string tekst) OdbierzPlik(BinaryReader reader)
     {
         string nazwa = reader.ReadString();
         long rozmiar = reader.ReadInt64();
         byte[] dane = reader.ReadBytes((int)rozmiar);
 
         Console.WriteLine($"[SERWER] Odebrano plik: {nazwa} ({rozmiar} bajtow)");
-        return System.Text.Encoding.UTF8.GetString(dane);
+        return (nazwa, System.Text.Encoding.UTF8.GetString(dane));
     }
+
     static void ObsluzKlienta(TcpClient klient)
     {
         try
@@ -90,19 +52,43 @@ class Server
 
                 // Odbierz plik 1
                 Console.WriteLine("[SERWER] Odbieram plik 1...");
-                string tekst1 = OdbierzPlik(reader);
+                var (nazwa1, tekst1) = OdbierzPlik(reader);
 
                 // Odbierz plik 2
                 Console.WriteLine("[SERWER] Odbieram plik 2...");
-                string tekst2 = OdbierzPlik(reader);
+                var (nazwa2, tekst2) = OdbierzPlik(reader);
 
                 Console.WriteLine("[SERWER] Otrzymałem parę. Przystępuje do generowania i wypisania ngramów");
 
+                //1. generowanie n-gramów dla obu tekstów
                 HashSet<string> ngramy1 = GenerujNgramy(tekst1, n);
                 HashSet<string> ngramy2 = GenerujNgramy(tekst2, n);
-                
+
+                //intersection - czesc wspolna n-gramow
+                var intersection = new HashSet<string>(ngramy1);
+                intersection.IntersectWith(ngramy2);
+
+                //jaccard - podobienstwo w procentach
                 double Jaccard = ObliczJaccard(ngramy1, ngramy2);
                 Console.WriteLine($"Współczynnik Jaccarda: {Jaccard}%");
+
+                //dwustronne podobienstwo
+                var (aDoB, bDoA) = ObliczDwustronne(ngramy1, ngramy2);
+
+                //zdania z podobnymi fragmentami
+                var zdania1 = ZnajdzPodobneZdania(tekst1, intersection, n);
+                var zdania2 = ZnajdzPodobneZdania(tekst2, intersection, n);
+
+                // zapis do CSV
+                ZapiszPelnyCSV(nazwa1, nazwa2, Jaccard, aDoB, bDoA, zdania1, zdania2);
+
+                //wysylanie wyniku do klienta, bo generowalo blad przy braku
+                writer.Write(Jaccard);
+                writer.Write(aDoB);
+                writer.Write(bDoA);
+                writer.Write(zdania1.Count);
+                writer.Write(zdania2.Count);
+
                 Console.WriteLine("[SERWER] Zakonczono!");
             }
         }
@@ -111,6 +97,7 @@ class Server
             Console.WriteLine($"[SERWER] Blad: {e.Message}");
         }
     }
+
     // na razie liczy slowa, pozniej zastapiona przez PorownajPliki()
     static int LiczSlowa(string tekst)
     {
@@ -134,14 +121,15 @@ class Server
         List<String> slowa = PodzielNaSlowa(tekst);
         HashSet<string> ngramy = new HashSet<string>();
 
-        for (int i = 0; i <= slowa.Count - n; i++) 
+        for (int i = 0; i <= slowa.Count - n; i++)
         {
-            string ngram = string.Join(" ", slowa.GetRange(i, n)); 
+            string ngram = string.Join(" ", slowa.GetRange(i, n));
             ngramy.Add(ngram);
         }
         // TODO: kazdy n-gram dodac do HashSet
         return ngramy;
     }
+
     //dzielimy tekst na slowa
     static List<string> PodzielNaSlowa(string tekst)
     {
@@ -165,7 +153,92 @@ class Server
         if (union.Count == 0) return 0;
 
         return (double)intersection.Count / union.Count * 100.0;
-        return 0.0;
+    }
+
+    static (double, double) ObliczDwustronne(HashSet<string> A, HashSet<string> B)
+    {
+        var intersection = new HashSet<string>(A);
+        intersection.IntersectWith(B);
+
+        if (A.Count == 0 || B.Count == 0)
+            return (0, 0);
+
+        double aDoB = (double)intersection.Count / A.Count * 100.0;
+        double bDoA = (double)intersection.Count / B.Count * 100.0;
+
+        return (aDoB, bDoA);
+    }
+
+    static List<string> PodzielNaZdania(string tekst)
+    {
+        return Regex.Split(tekst, @"(?<=[\.!\?])\s+")
+            .Where(s => !string.IsNullOrWhiteSpace(s))
+            .ToList();
+    }
+
+    static List<string> ZnajdzPodobneZdania(string tekst, HashSet<string> wspolne, int n)
+    {
+        var zdania = PodzielNaZdania(tekst);
+        var wynik = new List<string>();
+
+        foreach (var zdanie in zdania)
+        {
+            var ngramy = GenerujNgramy(zdanie, n);
+
+            foreach (var ng in ngramy)
+            {
+                if (wspolne.Contains(ng))
+                {
+                    wynik.Add(zdanie);
+                    break;
+                }
+            }
+        }
+
+        return wynik.Distinct().ToList();
+    }
+
+    static void ZapiszPelnyCSV(
+        string nazwaA,
+        string nazwaB,
+        double jaccard,
+        double aDoB,
+        double bDoA,
+        List<string> zdania1,
+        List<string> zdania2)
+    {
+        string fileA = Path.GetFileNameWithoutExtension(nazwaA);
+        string fileB = Path.GetFileNameWithoutExtension(nazwaB);
+
+        Directory.CreateDirectory("wyniki");
+
+        string timestamp = DateTime.Now.ToString("yyyyMMdd_HHmmss");
+
+        string sciezka = Path.Combine("wyniki",
+            $"{fileA}_VS_{fileB}_{timestamp}.csv");
+
+        using (StreamWriter sw = new StreamWriter(sciezka))
+        {
+            sw.WriteLine("PlikA,PlikB,Jaccard,A->B,B->A,Typ,Dane");
+
+            // uzyj InvariantCulture zeby kropka byla separatorem dziesietnym a nie przecinek
+            string jaccardStr = jaccard.ToString("F2", System.Globalization.CultureInfo.InvariantCulture);
+            string aDoBStr = aDoB.ToString("F2", System.Globalization.CultureInfo.InvariantCulture);
+            string bDoAStr = bDoA.ToString("F2", System.Globalization.CultureInfo.InvariantCulture);
+
+            // statystyka
+            sw.WriteLine($"{fileA},{fileB},{jaccardStr},{aDoBStr},{bDoAStr},STATYSTYKA,-");
+
+            // zdania A
+            foreach (var z in zdania1)
+                sw.WriteLine($"{fileA},{fileB},,,,ZDANIE_A,\"{z}\"");
+
+            // zdania B
+            foreach (var z in zdania2)
+                sw.WriteLine($"{fileA},{fileB},,,,ZDANIE_B,\"{z}\"");
+        }
+
+        Console.WriteLine($"[SERWER] Zapisano CSV: {sciezka}");
     }
 
     // sprawdza czy wynik przekracza prog plagiatu

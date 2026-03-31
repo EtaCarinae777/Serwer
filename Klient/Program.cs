@@ -116,49 +116,7 @@ class Client
         Console.WriteLine("Lacznie par: " + pary.Count);
     }
 
-    // na razie wysyla dwa teksty i odbiera liczbe slow
-    // pozniej zastapiona przez WyslijZadanie()
-    static void WyslijTeksty(string adres, string tekst1, string tekst2)
-    {
-        try
-        {
-            Console.WriteLine("[KLIENT] Lacze sie z serwerem " + adres + ":" + port + "...");
-            TcpClient klient = new TcpClient(adres, port);
-            Console.WriteLine("[KLIENT] Polaczono!");
-            Thread.Sleep(500);
-
-            NetworkStream stream = klient.GetStream();
-            BinaryReader reader = new BinaryReader(stream);
-            BinaryWriter writer = new BinaryWriter(stream);
-
-            Console.WriteLine("[KLIENT] Wysylam parametry (n=" + n + " grainSize=" + grainSize + ")...");
-            writer.Write(n);
-            writer.Write(grainSize);
-            Thread.Sleep(500);
-
-            Console.WriteLine("[KLIENT] Wysylam tekst 1...");
-            writer.Write(tekst1);
-            Thread.Sleep(500);
-
-            Console.WriteLine("[KLIENT] Wysylam tekst 2...");
-            writer.Write(tekst2);
-            Thread.Sleep(500);
-
-            Console.WriteLine("[KLIENT] Czekam na wyniki od serwera...");
-            int iloscSlow1 = reader.ReadInt32();
-            int iloscSlow2 = reader.ReadInt32();
-
-            Console.WriteLine("[KLIENT] Otrzymalem wyniki!");
-            Console.WriteLine("[KLIENT] Tekst 1 ma slow: " + iloscSlow1);
-            Console.WriteLine("[KLIENT] Tekst 2 ma slow: " + iloscSlow2);
-
-            klient.Close();
-        }
-        catch (Exception e)
-        {
-            Console.WriteLine("Blad: " + e.Message);
-        }
-    }
+    
 
     // wysyla jeden plik przez siec
     static void WyslijPlik(BinaryWriter writer, string sciezka)
@@ -196,13 +154,25 @@ class Client
 
                 writer.Flush();
 
+                //odebranie wyniku zaka :DD
                 Console.WriteLine("[KLIENT] Czekam na wyniki od serwera...");
-                int iloscSlow1 = reader.ReadInt32();
-                int iloscSlow2 = reader.ReadInt32();
+                double jaccard = reader.ReadDouble();
+                double aDoB = reader.ReadDouble();
+                double bDoA = reader.ReadDouble();
+                int liczbaPodobnychZdan1 = reader.ReadInt32();
+                int liczbaPodobnychZdan2 = reader.ReadInt32();
 
-                Console.WriteLine("[KLIENT] Otrzymalem wyniki!");
-                Console.WriteLine($"[KLIENT] Plik 1 ma slow: {iloscSlow1}");
-                Console.WriteLine($"[KLIENT] Plik 2 ma slow: {iloscSlow2}");
+                Console.WriteLine("\n=== WYNIK POROWNANIA ===");
+                Console.WriteLine("Plik 1: " + Path.GetFileName(sciezka1));
+                Console.WriteLine("Plik 2: " + Path.GetFileName(sciezka2));
+                Console.WriteLine("Podobienstwo Jaccarda:     " + jaccard.ToString("F2") + "%");
+                Console.WriteLine("Plik 1 zawarty w pliku 2:  " + aDoB.ToString("F2") + "%");
+                Console.WriteLine("Plik 2 zawarty w pliku 1:  " + bDoA.ToString("F2") + "%");
+                Console.WriteLine("Podobne zdania w pliku 1:  " + liczbaPodobnychZdan1);
+                Console.WriteLine("Podobne zdania w pliku 2:  " + liczbaPodobnychZdan2);
+
+                Console.WriteLine("[KLIENT] Otrzymalem wynik!");
+                Console.WriteLine("[KLIENT] Podobienstwo: " + jaccard.ToString("F2") + "%");
             }
         }
         catch (Exception e)
