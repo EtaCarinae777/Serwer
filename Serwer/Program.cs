@@ -6,6 +6,7 @@ using System.Net.Sockets;
 using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
+using static System.Net.Mime.MediaTypeNames;
 
 class Server
 {
@@ -20,10 +21,10 @@ class Server
         {
             TcpClient klient = serwer.AcceptTcpClient();
             Console.WriteLine("Nowe polaczenie od klienta");
-            Task.Run(() => OdbierzPliki(klient));
+            Task.Run(() => ObsluzKlienta(klient));
 
         }
-    }
+    }   
 
     static void OdbierzTeksty(TcpClient klient)
     {
@@ -72,7 +73,7 @@ class Server
         Console.WriteLine($"[SERWER] Odebrano plik: {nazwa} ({rozmiar} bajtow)");
         return System.Text.Encoding.UTF8.GetString(dane);
     }
-    static void OdbierzPliki(TcpClient klient)
+    static void ObsluzKlienta(TcpClient klient)
     {
         try
         {
@@ -95,8 +96,13 @@ class Server
                 Console.WriteLine("[SERWER] Odbieram plik 2...");
                 string tekst2 = OdbierzPlik(reader);
 
-                Console.WriteLine("[SERWER] Otrzymałem parę: ");
+                Console.WriteLine("[SERWER] Otrzymałem parę. Przystępuje do generowania i wypisania ngramów");
 
+                HashSet<string> ngramy1 = GenerujNgramy(tekst1, n);
+                HashSet<string> ngramy2 = GenerujNgramy(tekst2, n);
+                
+                double Jaccard = ObliczJaccard(ngramy1, ngramy2);
+                Console.WriteLine($"Współczynnik Jaccarda: {Jaccard}%");
                 Console.WriteLine("[SERWER] Zakonczono!");
             }
         }
@@ -150,8 +156,15 @@ class Server
     static double ObliczJaccard(HashSet<string> ngramyA, HashSet<string> ngramyB)
     {
         // TODO: obliczyc czesc wspolna (intersection)
+        var intersection = new HashSet<string>(ngramyA);
+        intersection.IntersectWith(ngramyB);
         // TODO: obliczyc sume zbiorow (union)
+        var union = new HashSet<string>(ngramyA);
+        union.UnionWith(ngramyB);
         // TODO: podzielic i zwrocic wynik * 100
+        if (union.Count == 0) return 0;
+
+        return (double)intersection.Count / union.Count * 100.0;
         return 0.0;
     }
 
