@@ -1,10 +1,12 @@
 ﻿using System;
+using System.Collections.Generic;
+using System.IO;
 using System.Net;
 using System.Net.Sockets;
-using System.IO;
+using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
-using System.Collections.Generic;
+using static System.Net.Mime.MediaTypeNames;
 
 class Server
 {
@@ -14,24 +16,17 @@ class Server
     {
         TcpListener serwer = new TcpListener(IPAddress.Any, port);
         serwer.Start();
-        //testowalem sobie generowanie tych ngramow i dziala essa.
-        /*Console.WriteLine("Serwer dziala na porcie " + port);
-        string tekst = "Lorem ipsum dolor sit amet, consectetur adipiscing elit. Cras in pellentesque odio, eget vehicula tortor. Proin in hendrerit turpis. Sed sit amet porttitor nisl.";
-        HashSet<string> ngramy = GenerujNgramy(tekst, 4);
-        foreach (var ngram in ngramy)
-        {
-            Console.WriteLine("-" + ngram);
-        }
-        */
+
         while (true)
         {
             TcpClient klient = serwer.AcceptTcpClient();
             Console.WriteLine("Nowe polaczenie od klienta");
             Task.Run(() => ObsluzKlienta(klient));
-        }
-    }
 
-    static void ObsluzKlienta(TcpClient klient)
+        }
+    }   
+
+    static void OdbierzTeksty(TcpClient klient)
     {
         NetworkStream stream = klient.GetStream();
         BinaryReader reader = new BinaryReader(stream);
@@ -69,7 +64,53 @@ class Server
         klient.Close();
 
     }
+    static string OdbierzPlik(BinaryReader reader)
+    {
+        string nazwa = reader.ReadString();
+        long rozmiar = reader.ReadInt64();
+        byte[] dane = reader.ReadBytes((int)rozmiar);
 
+        Console.WriteLine($"[SERWER] Odebrano plik: {nazwa} ({rozmiar} bajtow)");
+        return System.Text.Encoding.UTF8.GetString(dane);
+    }
+    static void ObsluzKlienta(TcpClient klient)
+    {
+        try
+        {
+            using (NetworkStream stream = klient.GetStream())
+            using (BinaryReader reader = new BinaryReader(stream))
+            using (BinaryWriter writer = new BinaryWriter(stream))
+            {
+                Console.WriteLine("[SERWER] Klient polaczony!");
+
+                // Odbierz parametry
+                int n = reader.ReadInt32();
+                int grainSize = reader.ReadInt32();
+                Console.WriteLine($"[SERWER] Parametry: n={n}, grainSize={grainSize}");
+
+                // Odbierz plik 1
+                Console.WriteLine("[SERWER] Odbieram plik 1...");
+                string tekst1 = OdbierzPlik(reader);
+
+                // Odbierz plik 2
+                Console.WriteLine("[SERWER] Odbieram plik 2...");
+                string tekst2 = OdbierzPlik(reader);
+
+                Console.WriteLine("[SERWER] Otrzymałem parę. Przystępuje do generowania i wypisania ngramów");
+
+                HashSet<string> ngramy1 = GenerujNgramy(tekst1, n);
+                HashSet<string> ngramy2 = GenerujNgramy(tekst2, n);
+                
+                double Jaccard = ObliczJaccard(ngramy1, ngramy2);
+                Console.WriteLine($"Współczynnik Jaccarda: {Jaccard}%");
+                Console.WriteLine("[SERWER] Zakonczono!");
+            }
+        }
+        catch (Exception e)
+        {
+            Console.WriteLine($"[SERWER] Blad: {e.Message}");
+        }
+    }
     // na razie liczy slowa, pozniej zastapiona przez PorownajPliki()
     static int LiczSlowa(string tekst)
     {
@@ -104,6 +145,8 @@ class Server
     //dzielimy tekst na slowa
     static List<string> PodzielNaSlowa(string tekst)
     {
+        tekst = tekst.ToLower();
+        tekst = Regex.Replace(tekst, @"[^\p{L}\p{Nd}\s]+", "");
         return tekst
             .Split(new char[] { ' ', '\t', '\n', '\r' }, StringSplitOptions.RemoveEmptyEntries)
             .ToList();
@@ -113,8 +156,15 @@ class Server
     static double ObliczJaccard(HashSet<string> ngramyA, HashSet<string> ngramyB)
     {
         // TODO: obliczyc czesc wspolna (intersection)
+        var intersection = new HashSet<string>(ngramyA);
+        intersection.IntersectWith(ngramyB);
         // TODO: obliczyc sume zbiorow (union)
+        var union = new HashSet<string>(ngramyA);
+        union.UnionWith(ngramyB);
         // TODO: podzielic i zwrocic wynik * 100
+        if (union.Count == 0) return 0;
+
+        return (double)intersection.Count / union.Count * 100.0;
         return 0.0;
     }
 
