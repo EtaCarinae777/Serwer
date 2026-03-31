@@ -15,20 +15,13 @@ class Server
     {
         TcpListener serwer = new TcpListener(IPAddress.Any, port);
         serwer.Start();
-        //testowalem sobie generowanie tych ngramow i dziala.
-        /*Console.WriteLine("Serwer dziala na porcie " + port);
-        string tekst = "Lorem ipsum dolor sit amet, consectetur adipiscing elit. Cras in pellentesque odio, eget vehicula tortor. Proin in hendrerit turpis. Sed sit amet porttitor nisl.";
-        HashSet<string> ngramy = GenerujNgramy(tekst, 4);
-        foreach (var ngram in ngramy)
-        {
-            Console.WriteLine("-" + ngram);
-        }*/
 
         while (true)
         {
             TcpClient klient = serwer.AcceptTcpClient();
             Console.WriteLine("Nowe polaczenie od klienta");
             Task.Run(() => OdbierzPliki(klient));
+
         }
     }
 
@@ -102,7 +95,7 @@ class Server
                 Console.WriteLine("[SERWER] Odbieram plik 2...");
                 string tekst2 = OdbierzPlik(reader);
 
-                Console.WriteLine("[SERWER] Otrzymałem wszystkie pliki");
+                Console.WriteLine("[SERWER] Otrzymałem parę: ");
 
                 Console.WriteLine("[SERWER] Zakonczono!");
             }
