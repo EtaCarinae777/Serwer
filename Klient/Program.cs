@@ -23,14 +23,11 @@ class Client
         List<(string, string)> pary = GenerujPary(posortowane);
         WyswietlPary(pary);
 
-        //pobieranie dwoch tekstwo i wyslanie do serwera
-        Console.WriteLine("Wpisz tekst 1:");
-        string tekst1 = Console.ReadLine();
-
-        Console.WriteLine("Wpisz tekst 2:");
-        string tekst2 = Console.ReadLine();
-
-        WyslijTeksty(adresySerwera[0], tekst1, tekst2);
+        foreach (var para in pary)
+        {
+            Console.WriteLine($"\n[KLIENT] Wysylam pare: {Path.GetFileName(para.Item1)} <-> {Path.GetFileName(para.Item2)}");
+            WyslijParyPlikow(adresySerwera[0], para.Item1, para.Item2);
+        }
 
         // pozniej tutaj bedzie:
         // List<(string, string, double)> wyniki = RozdzielZadania(pary, posortowane);
@@ -167,11 +164,51 @@ class Client
     static void WyslijPlik(BinaryWriter writer, string sciezka)
     {
         byte[] dane = File.ReadAllBytes(sciezka);
-        string nazwa = System.IO.Path.GetFileName(sciezka);
+        string nazwa = Path.GetFileName(sciezka);
 
-        writer.Write(nazwa);
-        writer.Write((long)dane.Length);
-        writer.Write(dane);
+        writer.Write(nazwa);              // Nazwa pliku
+        writer.Write((long)dane.Length);  // Rozmiar pliku
+        writer.Write(dane);               // Dane pliku
+    }
+
+    static void WyslijParyPlikow(string adres, string sciezka1, string sciezka2)
+    {
+        try
+        {
+            Console.WriteLine($"[KLIENT] Lacze sie z serwerem {adres}:{port}...");
+
+            using (TcpClient klient = new TcpClient(adres, port))
+            using (NetworkStream stream = klient.GetStream())
+            using (BinaryReader reader = new BinaryReader(stream))
+            using (BinaryWriter writer = new BinaryWriter(stream))
+            {
+                Console.WriteLine("[KLIENT] Polaczono!");
+
+                Console.WriteLine($"[KLIENT] Wysylam parametry (n={n} grainSize={grainSize})...");
+                writer.Write(n);
+                writer.Write(grainSize);
+
+                Console.WriteLine("[KLIENT] Wysylam plik 1...");
+                WyslijPlik(writer, sciezka1);
+
+                Console.WriteLine("[KLIENT] Wysylam plik 2...");
+                WyslijPlik(writer, sciezka2);
+
+                writer.Flush();
+
+                Console.WriteLine("[KLIENT] Czekam na wyniki od serwera...");
+                int iloscSlow1 = reader.ReadInt32();
+                int iloscSlow2 = reader.ReadInt32();
+
+                Console.WriteLine("[KLIENT] Otrzymalem wyniki!");
+                Console.WriteLine($"[KLIENT] Plik 1 ma slow: {iloscSlow1}");
+                Console.WriteLine($"[KLIENT] Plik 2 ma slow: {iloscSlow2}");
+            }
+        }
+        catch (Exception e)
+        {
+            Console.WriteLine($"[KLIENT] Blad: {e.Message}");
+        }
     }
 
     // rozdziela pary miedzy dostepne serwery
