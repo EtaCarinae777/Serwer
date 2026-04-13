@@ -8,9 +8,9 @@ class Client
 {
     static List<string> adresySerwera = new List<string>
     {
-        "127.0.0.1"
-        // "192.168.1.x" // drugi komputer
-        // "192.168.1.y" // trzeci komputer
+        "192.168.0.30",
+        "192.168.0.32"
+        
     };
     static int port = 8001;
     static int n = 4;
@@ -23,11 +23,8 @@ class Client
         List<(string, string)> pary = GenerujPary(posortowane);
         WyswietlPary(pary);
 
-        foreach (var para in pary)
-        {
-            Console.WriteLine($"\n[KLIENT] Wysylam pare: {Path.GetFileName(para.Item1)} <-> {Path.GetFileName(para.Item2)}");
-            WyslijParyPlikow(adresySerwera[0], para.Item1, para.Item2);
-        }
+        var wyniki = RozdzielZadania(pary, posortowane);
+        WyswietlMacierz(wyniki, posortowane);
 
         // pozniej tutaj bedzie:
         // List<(string, string, double)> wyniki = RozdzielZadania(pary, posortowane);
@@ -184,11 +181,24 @@ class Client
     // rozdziela pary miedzy dostepne serwery
     static List<(string, string, double)> RozdzielZadania(List<(string, string)> pary, List<string> pliki)
     {
-        // TODO: podzielic pary na paczki wg grainSize
-        // TODO: przydzielic paczki do serwerow round-robin
-        // TODO: wyslac zadania wspolbieznie za pomoca ConcurrentQueue
-        // TODO: zebrac wyniki i zwrocic
-        return new List<(string, string, double)>();
+        List<Task<(string, string, double)>> taski = new List<Task<(string, string, double)>>();
+
+        for (int i = 0; i < pary.Count; i++)
+        {
+            var para = pary[i];
+            string adres = adresySerwera[i % adresySerwera.Count];
+
+            var task = Task.Run(() =>
+            {
+                return WyslijZadanie(adres, para.Item1, para.Item2);
+            });
+
+            taski.Add(task);
+        }
+
+        Task.WaitAll(taski.ToArray());
+
+        return taski.Select(t => t.Result).ToList();
     }
 
     // wysyla dwa pliki do serwera i odbiera wynik podobienstwa
@@ -207,17 +217,21 @@ class Client
             WyslijPlik(writer, plikA);
             WyslijPlik(writer, plikB);
 
-            string nazwaA = reader.ReadString();
-            string nazwaB = reader.ReadString();
-            double podobienstwo = reader.ReadDouble();
+            writer.Flush();
+
+            double jaccard = reader.ReadDouble();
+            double aDoB = reader.ReadDouble();
+            double bDoA = reader.ReadDouble();
+            int liczba1 = reader.ReadInt32();
+            int liczba2 = reader.ReadInt32();
 
             klient.Close();
-            return (nazwaA, nazwaB, podobienstwo);
+
+            return (plikA, plikB, jaccard);
         }
         catch (Exception e)
         {
             Console.WriteLine("Blad polaczenia z " + adres + ": " + e.Message);
-            // TODO: ponowna proba z innym serwerem
             return (plikA, plikB, -1);
         }
     }
