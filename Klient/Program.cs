@@ -8,9 +8,10 @@ class Client
 {
     static List<string> adresySerwera = new List<string>
     {
-        "192.168.0.30",
-        "192.168.0.32"
-        
+        //"192.168.0.30",
+        "192.168.0.32",
+        //"192.168.0.13"
+
     };
     static int port = 8001;
     static int n = 4;
