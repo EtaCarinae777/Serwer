@@ -158,6 +158,7 @@ class Client
                 double bDoA = reader.ReadDouble();
                 int liczbaPodobnychZdan1 = reader.ReadInt32();
                 int liczbaPodobnychZdan2 = reader.ReadInt32();
+                string csv = reader.ReadString(); 
 
                 Console.WriteLine("\n=== WYNIK POROWNANIA ===");
                 Console.WriteLine("Plik 1: " + Path.GetFileName(sciezka1));
@@ -254,15 +255,16 @@ class Client
                     writer.Flush();
 
                     // Odbieranie danych - DODAJ TRY-CATCH tutaj, jeśli serwer może wysłać śmieci
-                    double jaccard = reader.ReadDouble();
-
                     // Musimy odczytać WSZYSTKO co serwer wysłał, 
                     // żeby nie zostawić śmieci w buforze (nawet jeśli nie używasz tych zmiennych)
-                    reader.ReadDouble(); // aDoB
-                    reader.ReadDouble(); // bDoA
-                    reader.ReadInt32();  // liczba1
-                    reader.ReadInt32();  // liczba2
-
+                    double jaccard = reader.ReadDouble();
+                    double aDoB = reader.ReadDouble();
+                    double bDoA = reader.ReadDouble();
+                    int liczba1 = reader.ReadInt32();
+                    int liczba2 = reader.ReadInt32();
+                    string csv = reader.ReadString();
+                    
+                    ZapiszCSVLokalnie(plikA, plikB, csv);
                     return (plikA, plikB, jaccard);
                 }
             }
@@ -282,6 +284,22 @@ class Client
             Console.WriteLine($"[BŁĄD NIEOCZEKIWANY] {adres}: {ex.Message}");
             return (plikA, plikB, -1);
         }
+    }
+
+    static void ZapiszCSVLokalnie(string plikA, string plikB, string csv)
+    {
+        string folder = "Raporty";
+        Directory.CreateDirectory(folder);
+
+        string nameA = Path.GetFileNameWithoutExtension(plikA);
+        string nameB = Path.GetFileNameWithoutExtension(plikB);
+
+        string path = Path.Combine(folder,
+            $"{nameA}_VS_{nameB}_{DateTime.Now:yyyyMMdd_HHmmss}.csv");
+
+        File.WriteAllText(path, csv);
+
+        Console.WriteLine($"[KLIENT] Zapisano raport: {path}");
     }
 
     // wyswietla wyniki w konsoli
