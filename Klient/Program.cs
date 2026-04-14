@@ -3,15 +3,13 @@ using System.IO;
 using System.Net.Sockets;
 using System.Threading;
 using System.Collections.Generic;
+using System.Linq;
 
 class Client
 {
     static List<string> adresySerwera = new List<string>
     {
-        //"192.168.0.30",
-        "192.168.0.32",
-        "192.168.0.13"
-
+        "127.0.0.1",
     };
     static int port = 8001;
     static int n = 4;
@@ -24,12 +22,16 @@ class Client
         List<(string, string)> pary = GenerujPary(posortowane);
         WyswietlPary(pary);
 
-        var wyniki = RozdzielZadania(pary, posortowane);
-        WyswietlMacierz(wyniki, posortowane);
+        // mierzymy czas calej analizy
+        var stoperCalkowity = System.Diagnostics.Stopwatch.StartNew();
 
-        // pozniej tutaj bedzie:
-        // List<(string, string, double)> wyniki = RozdzielZadania(pary, posortowane);
-        // WyswietlMacierz(wyniki, posortowane);
+        var wyniki = RozdzielZadania(pary, posortowane);
+
+        stoperCalkowity.Stop();
+        long czasCalkowitejAnalizy = stoperCalkowity.ElapsedMilliseconds;
+
+        WyswietlMacierz(wyniki, posortowane);
+        WyswietlPodsumowanie(wyniki, pary.Count, czasCalkowitejAnalizy);
     }
 
     // pyta uzytkownika o sciezki do plikow
@@ -114,8 +116,6 @@ class Client
         Console.WriteLine("Lacznie par: " + pary.Count);
     }
 
-    
-
     // wysyla jeden plik przez siec
     static void WyslijPlik(BinaryWriter writer, string sciezka)
     {
@@ -157,9 +157,20 @@ class Client
                 double jaccard = reader.ReadDouble();
                 double aDoB = reader.ReadDouble();
                 double bDoA = reader.ReadDouble();
-                int liczbaPodobnychZdan1 = reader.ReadInt32();
-                int liczbaPodobnychZdan2 = reader.ReadInt32();
-                string csv = reader.ReadString(); 
+
+                // odbieramy zakresy pliku 1
+                int liczbaZakresow1 = reader.ReadInt32();
+                var zakresy1 = new List<(int od, int do_)>();
+                for (int i = 0; i < liczbaZakresow1; i++)
+                    zakresy1.Add((reader.ReadInt32(), reader.ReadInt32()));
+
+                // odbieramy zakresy pliku 2
+                int liczbaZakresow2 = reader.ReadInt32();
+                var zakresy2 = new List<(int od, int do_)>();
+                for (int i = 0; i < liczbaZakresow2; i++)
+                    zakresy2.Add((reader.ReadInt32(), reader.ReadInt32()));
+
+                string csv = reader.ReadString();
 
                 Console.WriteLine("\n=== WYNIK POROWNANIA ===");
                 Console.WriteLine("Plik 1: " + Path.GetFileName(sciezka1));
@@ -167,11 +178,8 @@ class Client
                 Console.WriteLine("Podobienstwo Jaccarda:     " + jaccard.ToString("F2") + "%");
                 Console.WriteLine("Plik 1 zawarty w pliku 2:  " + aDoB.ToString("F2") + "%");
                 Console.WriteLine("Plik 2 zawarty w pliku 1:  " + bDoA.ToString("F2") + "%");
-                Console.WriteLine("Podobne zdania w pliku 1:  " + liczbaPodobnychZdan1);
-                Console.WriteLine("Podobne zdania w pliku 2:  " + liczbaPodobnychZdan2);
-
-                Console.WriteLine("[KLIENT] Otrzymalem wynik!");
-                Console.WriteLine("[KLIENT] Podobienstwo: " + jaccard.ToString("F2") + "%");
+                Console.WriteLine("Podobne fragmenty w pliku 1:  " + liczbaZakresow1);
+                Console.WriteLine("Podobne fragmenty w pliku 2:  " + liczbaZakresow2);
             }
         }
         catch (Exception e)
@@ -183,26 +191,43 @@ class Client
     // rozdziela pary miedzy dostepne serwery
     static List<(string, string, double)> RozdzielZadania(List<(string, string)> pary, List<string> pliki)
     {
-        List<Task<(string, string, double)>> taski = new List<Task<(string, string, double)>>();
+        // wrzucamy wszystkie pary do kolejki
+        var kolejka = new System.Collections.Concurrent.ConcurrentQueue<(string, string)>();
+        foreach (var para in pary)
+            kolejka.Enqueue(para);
 
-        for (int i = 0; i < pary.Count; i++)
+        // lista na wyniki - ConcurrentBag bo wiele watkow bedzie dodawac wyniki jednoczesnie
+        var wyniki = new System.Collections.Concurrent.ConcurrentBag<(string, string, double)>();
+
+        // tworzymy tyle watkow ile mamy serwerow
+        List<Task> taski = new List<Task>();
+
+        for (int i = 0; i < adresySerwera.Count; i++)
         {
-            var para = pary[i];
-            // i % adresySerwera.Count sugeruje startowy serwer, 
-            // aby nie wszystkie zadania uderzały w ten sam serwer na starcie
-            int startowyIndeks = i % adresySerwera.Count;
+            int indeksSerwera = i;
 
             var task = Task.Run(() =>
             {
-                return WyslijZadanie_Failover(startowyIndeks, para.Item1, para.Item2);
+                // kazdy watek pobiera pary z kolejki dopoki sa dostepne
+                while (kolejka.TryDequeue(out var para))
+                {
+                    Console.WriteLine($"[KLIENT] Serwer {adresySerwera[indeksSerwera]} pobral pare: " +
+                        Path.GetFileName(para.Item1) + " vs " + Path.GetFileName(para.Item2));
+
+                    var wynik = WyslijZadanie_Failover(indeksSerwera, para.Item1, para.Item2);
+                    wyniki.Add(wynik);
+                }
             });
 
             taski.Add(task);
         }
 
+        // czekamy az wszystkie watki skoncza
         Task.WaitAll(taski.ToArray());
-        return taski.Select(t => t.Result).ToList();
+
+        return wyniki.ToList();
     }
+
     static (string, string, double) WyslijZadanie_Failover(int startIdx, string plikA, string plikB)
     {
         // Próbujemy po kolei każdego serwera z listy
@@ -211,61 +236,74 @@ class Client
             int aktualnyIndeks = (startIdx + i) % adresySerwera.Count;
             string adres = adresySerwera[aktualnyIndeks];
 
-            // Wykorzystujemy Twoją istniejącą funkcję WyslijZadanie
             var wynik = WyslijZadanie(adres, plikA, plikB);
 
-            // Jeśli wynik jest poprawny (nie -1), zwracamy go i kończymy próby dla tej pary
             if (wynik.Item3 >= 0)
-            {
                 return wynik;
-            }
 
             Console.WriteLine($"[FAILOVER] Serwer {adres} zawiódł dla pary {Path.GetFileName(plikA)} vs {Path.GetFileName(plikB)}. Próbuję następny...");
         }
 
-        // Jeśli pętla się skończyła i żaden serwer nie odpowiedział
         return (plikA, plikB, -1.0);
     }
 
     // wysyla dwa pliki do serwera i odbiera wynik podobienstwa
     static (string, string, double) WyslijZadanie(string adres, string plikA, string plikB)
     {
-        // Klauzula using automatycznie zamknie połączenie, nawet jak wystąpi błąd
         try
         {
             using (TcpClient klient = new TcpClient())
             {
-                // Ustawiamy krótkie timeouty (np. 5 sekund)
                 klient.ReceiveTimeout = 5000;
                 klient.SendTimeout = 5000;
-
-                // Próba połączenia
                 klient.Connect(adres, port);
 
                 using (NetworkStream stream = klient.GetStream())
                 using (BinaryWriter writer = new BinaryWriter(stream))
                 using (BinaryReader reader = new BinaryReader(stream))
                 {
-                    // Wysyłanie parametrów
+                    // mierzymy CALY czas od wyslania do odebrania
+                    var stoperCalkowity = System.Diagnostics.Stopwatch.StartNew();
+
                     writer.Write(n);
                     writer.Write(grainSize);
-
-                    // Wysyłanie plików
                     WyslijPlik(writer, plikA);
                     WyslijPlik(writer, plikB);
                     writer.Flush();
 
-                    // Odbieranie danych - DODAJ TRY-CATCH tutaj, jeśli serwer może wysłać śmieci
-                    // Musimy odczytać WSZYSTKO co serwer wysłał, 
-                    // żeby nie zostawić śmieci w buforze (nawet jeśli nie używasz tych zmiennych)
                     double jaccard = reader.ReadDouble();
                     double aDoB = reader.ReadDouble();
                     double bDoA = reader.ReadDouble();
-                    int liczba1 = reader.ReadInt32();
-                    int liczba2 = reader.ReadInt32();
+
+                    // odbieramy zakresy pliku 1
+                    int liczbaZakresow1 = reader.ReadInt32();
+                    var zakresy1 = new List<(int od, int do_)>();
+                    for (int i = 0; i < liczbaZakresow1; i++)
+                        zakresy1.Add((reader.ReadInt32(), reader.ReadInt32()));
+
+                    // odbieramy zakresy pliku 2
+                    int liczbaZakresow2 = reader.ReadInt32();
+                    var zakresy2 = new List<(int od, int do_)>();
+                    for (int i = 0; i < liczbaZakresow2; i++)
+                        zakresy2.Add((reader.ReadInt32(), reader.ReadInt32()));
+
                     string csv = reader.ReadString();
-                    
+                    long czasObliczenSerwera = reader.ReadInt64();
+
+                    stoperCalkowity.Stop();
+                    long czasCalkowity = stoperCalkowity.ElapsedMilliseconds;
+                    long czasTransmisji = czasCalkowity - czasObliczenSerwera;
+
+                    Console.WriteLine($"[CZAS] Obliczenia serwera: {czasObliczenSerwera} ms");
+                    Console.WriteLine($"[CZAS] Transmisja:         {czasTransmisji} ms");
+                    Console.WriteLine($"[CZAS] Calkowity:          {czasCalkowity} ms");
+                    Console.WriteLine($"[ZAKRESY] Plik 1: {liczbaZakresow1} fragmentow");
+                    Console.WriteLine($"[ZAKRESY] Plik 2: {liczbaZakresow2} fragmentow");
+
                     ZapiszCSVLokalnie(plikA, plikB, csv);
+                    ZapiszStatystyki(adres, plikA, plikB, jaccard,
+                                     czasObliczenSerwera, czasTransmisji, czasCalkowity);
+
                     return (plikA, plikB, jaccard);
                 }
             }
@@ -312,13 +350,9 @@ class Client
             string nazwaA = Path.GetFileName(a);
             string nazwaB = Path.GetFileName(b);
 
-            // 1. Obsługa tekstu wyniku (procent lub błąd)
             string wynikTekst = podobienstwo < 0 ? "BŁĄD POŁĄCZENIA" : $"{podobienstwo:F2}%";
-
-            // 2. Logika statusu plagiatu (tylko jeśli nie ma błędu)
             string status = (podobienstwo >= prog && podobienstwo >= 0) ? " [PLAGIAT?]" : "";
 
-            // 3. Wyświetlanie z opcjonalnym kolorem dla błędów
             if (podobienstwo < 0)
             {
                 Console.ForegroundColor = ConsoleColor.Red;
@@ -332,9 +366,112 @@ class Client
         }
     }
 
+    static void ZapiszStatystyki(string adres, string plikA, string plikB, double jaccard, long czasObliczen, long czasTransmisji, long czasCalkowity)
+    {
+        string folder = "Raporty";
+        Directory.CreateDirectory(folder);
+
+        string plik = Path.Combine(folder, "statystyki.csv");
+
+        bool nowyPlik = !File.Exists(plik);
+
+        using (StreamWriter sw = new StreamWriter(plik, append: true))
+        {
+            if (nowyPlik)
+                sw.WriteLine("Serwer,PlikA,PlikB,Jaccard,CzasObliczen_ms,CzasTransmisji_ms,CzasCalkowity_ms,Timestamp");
+
+            sw.WriteLine(
+                adres + "," +
+                Path.GetFileName(plikA) + "," +
+                Path.GetFileName(plikB) + "," +
+                jaccard.ToString("F2", System.Globalization.CultureInfo.InvariantCulture) + "," +
+                czasObliczen + "," +
+                czasTransmisji + "," +
+                czasCalkowity + "," +
+                DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss")
+            );
+        }
+    }
+
     // zapisuje wyniki do pliku CSV
     static void EksportujCSV(List<(string, string, double)> wyniki, string sciezkaWyjsciowa)
     {
         // TODO: StreamWriter, zapisac naglowek i kolejne wiersze
     }
+
+    static void WyswietlPodsumowanie(List<(string, string, double)> wyniki, int liczbaPar, long czasMs)
+    {
+        // filtrujemy tylko udane wyniki (bez bledow polaczenia)
+        var udane = wyniki.Where(w => w.Item3 >= 0).ToList();
+
+        if (udane.Count == 0)
+        {
+            Console.WriteLine("\n=== PODSUMOWANIE ===");
+            Console.WriteLine("Brak wynikow - wszystkie polaczenia zawiodly.");
+            return;
+        }
+
+        double najwyzsze = udane.Max(w => w.Item3);
+        double najnizsze = udane.Min(w => w.Item3);
+        double srednie = udane.Average(w => w.Item3);
+        int plagiatow = udane.Count(w => w.Item3 >= prog);
+
+        var paraNajwyzszego = udane.First(w => w.Item3 == najwyzsze);
+        var paraNajnizszego = udane.First(w => w.Item3 == najnizsze);
+
+        Console.WriteLine("\n=== PODSUMOWANIE ===");
+        Console.WriteLine("Przeanalizowano par:   " + liczbaPar);
+        Console.WriteLine("Czas calkowity:        " + czasMs + " ms");
+        Console.WriteLine("Wykrytych plagiatow:   " + plagiatow);
+        Console.WriteLine("Srednie podobienstwo:  " + srednie.ToString("F2") + "%");
+        Console.WriteLine("Najwyzsze podobienstwo: " +
+            Path.GetFileName(paraNajwyzszego.Item1) + " vs " +
+            Path.GetFileName(paraNajwyzszego.Item2) + " = " +
+            najwyzsze.ToString("F2") + "%");
+        Console.WriteLine("Najnizsze podobienstwo: " +
+            Path.GetFileName(paraNajnizszego.Item1) + " vs " +
+            Path.GetFileName(paraNajnizszego.Item2) + " = " +
+            najnizsze.ToString("F2") + "%");
+
+        // zapisujemy podsumowanie do statystyki
+        ZapiszPodsumowanie(liczbaPar, plagiatow, srednie, najwyzsze, najnizsze, czasMs);
+    }
+
+
+    static void ZapiszPodsumowanie(
+    int liczbaPar,
+    int plagiatow,
+    double srednie,
+    double najwyzsze,
+    double najnizsze,
+    long czasMs)
+    {
+        string folder = "Raporty";
+        Directory.CreateDirectory(folder);
+
+        string plik = Path.Combine(folder, "podsumowania.csv");
+
+        bool nowyPlik = !File.Exists(plik);
+
+        using (StreamWriter sw = new StreamWriter(plik, append: true))
+        {
+            if (nowyPlik)
+                sw.WriteLine("LiczbaSerwer ow,LiczbaPar,Plagiatow,Srednie,Najwyzsze,Najnizsze,CzasMs,Timestamp");
+
+            sw.WriteLine(
+                adresySerwera.Count + "," +
+                liczbaPar + "," +
+                plagiatow + "," +
+                srednie.ToString("F2", System.Globalization.CultureInfo.InvariantCulture) + "," +
+                najwyzsze.ToString("F2", System.Globalization.CultureInfo.InvariantCulture) + "," +
+                najnizsze.ToString("F2", System.Globalization.CultureInfo.InvariantCulture) + "," +
+                czasMs + "," +
+                DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss")
+            );
+        }
+
+        Console.WriteLine("[KLIENT] Zapisano podsumowanie: " + plik);
+    }
+
 }
+

@@ -1,6 +1,7 @@
 ﻿using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Linq;
 using System.Net;
 using System.Net.Sockets;
 using System.Text;
@@ -59,11 +60,16 @@ class Server
                 Console.WriteLine("[SERWER] Odbieram plik 2...");
                 var (nazwa2, tekst2) = OdbierzPlik(reader);
 
-                Console.WriteLine("[SERWER] Otrzymałem parę. Przystępuje do generowania i wypisania ngramów");
+                // mierzymy czas samych obliczen
+                var stoper = System.Diagnostics.Stopwatch.StartNew();
 
-                //1. generowanie n-gramów dla obu tekstów
-                HashSet<string> ngramy1 = GenerujNgramy(tekst1, n);
-                HashSet<string> ngramy2 = GenerujNgramy(tekst2, n);
+                // tokenizacja z pozycjami
+                var tokeny1 = PodzielNaSlowa(tekst1);
+                var tokeny2 = PodzielNaSlowa(tekst2);
+
+                // generowanie n-gramow z pozycjami
+                var (ngramy1, pozycje1) = GenerujNgramy(tokeny1, n);
+                var (ngramy2, pozycje2) = GenerujNgramy(tokeny2, n);
 
                 //intersection - czesc wspolna n-gramow
                 var intersection = new HashSet<string>(ngramy1);
@@ -76,24 +82,41 @@ class Server
                 //dwustronne podobienstwo
                 var (aDoB, bDoA) = ObliczDwustronne(ngramy1, ngramy2);
 
-                //zdania z podobnymi fragmentami
-                var zdania1 = ZnajdzPodobneZdania(tekst1, intersection, n);
-                var zdania2 = ZnajdzPodobneZdania(tekst2, intersection, n);
+                // zakresy podobnych fragmentow zamiast zdan
+                var zakresy1 = ZnajdzPodobneZakresy(pozycje1, intersection);
+                var zakresy2 = ZnajdzPodobneZakresy(pozycje2, intersection);
 
-                // zapis do CSV
-                string csvContent = GenerujCSV(
-                    nazwa1, nazwa2,
-                    Jaccard, aDoB, bDoA,
-                    zdania1, zdania2
-                    );
+                stoper.Stop();
+                long czasObliczenMs = stoper.ElapsedMilliseconds;
+                Console.WriteLine($"[SERWER] Czas obliczen: {czasObliczenMs} ms");
+                Console.WriteLine($"[SERWER] Znaleziono {zakresy1.Count} zakresow w pliku 1");
+                Console.WriteLine($"[SERWER] Znaleziono {zakresy2.Count} zakresow w pliku 2");
 
-                //wysylanie wyniku do klienta, bo generowalo blad przy braku
+                string csvContent = GenerujCSV(nazwa1, nazwa2, Jaccard, aDoB, bDoA, zakresy1, zakresy2);
+
+                // wysylamy wyniki
                 writer.Write(Jaccard);
                 writer.Write(aDoB);
                 writer.Write(bDoA);
-                writer.Write(zdania1.Count);
-                writer.Write(zdania2.Count);
+
+                // wysylamy zakresy pliku 1
+                writer.Write(zakresy1.Count);
+                foreach (var (od, do_) in zakresy1)
+                {
+                    writer.Write(od);
+                    writer.Write(do_);
+                }
+
+                // wysylamy zakresy pliku 2
+                writer.Write(zakresy2.Count);
+                foreach (var (od, do_) in zakresy2)
+                {
+                    writer.Write(od);
+                    writer.Write(do_);
+                }
+
                 writer.Write(csvContent);
+                writer.Write(czasObliczenMs);
 
                 Console.WriteLine("[SERWER] Zakonczono!");
             }
@@ -121,29 +144,58 @@ class Server
         return 0.0;
     }
 
-    // generuje zbior n-gramow dla podanego tekstu
-    static HashSet<string> GenerujNgramy(string tekst, int n)
+    // dzieli tekst na tokeny zachowujac pozycje w oryginalnym tekscie
+    // zwraca liste (slowo, pozycja_poczatku, pozycja_konca)
+    static List<(string slowo, int od, int do_)> PodzielNaSlowa(string tekst)
     {
-        List<String> slowa = PodzielNaSlowa(tekst);
-        HashSet<string> ngramy = new HashSet<string>();
+        var tokeny = new List<(string slowo, int od, int do_)>();
+        int i = 0;
 
-        for (int i = 0; i <= slowa.Count - n; i++)
+        while (i < tekst.Length)
         {
-            string ngram = string.Join(" ", slowa.GetRange(i, n));
-            ngramy.Add(ngram);
+            // pomijamy znaki niebedace literami ani cyframi
+            if (!char.IsLetterOrDigit(tekst[i]))
+            {
+                i++;
+                continue;
+            }
+
+            // znalezlismy poczatek slowa
+            int poczatek = i;
+
+            // idziemy do konca slowa
+            while (i < tekst.Length && char.IsLetterOrDigit(tekst[i]))
+                i++;
+
+            // zapisujemy slowo z pozycjami w oryginalnym tekscie
+            string slowo = tekst.Substring(poczatek, i - poczatek).ToLower();
+            tokeny.Add((slowo, poczatek, i));
         }
-        // TODO: kazdy n-gram dodac do HashSet
-        return ngramy;
+
+        return tokeny;
     }
 
-    //dzielimy tekst na slowa
-    static List<string> PodzielNaSlowa(string tekst)
+    // generuje n-gramy z tokenow
+    // zwraca zbior n-gramow (do Jaccarda)
+    // oraz slownik ngram -> (od, do) potrzebny do podswietlania
+    static (HashSet<string> ngramy, Dictionary<string, (int od, int do_)> pozycje)
+        GenerujNgramy(List<(string slowo, int od, int do_)> tokeny, int n)
     {
-        tekst = tekst.ToLower();
-        tekst = Regex.Replace(tekst, @"[^\p{L}\p{Nd}\s]+", "");
-        return tekst
-            .Split(new char[] { ' ', '\t', '\n', '\r' }, StringSplitOptions.RemoveEmptyEntries)
-            .ToList();
+        var ngramy = new HashSet<string>();
+        var pozycje = new Dictionary<string, (int od, int do_)>();
+
+        for (int i = 0; i <= tokeny.Count - n; i++)
+        {
+            // laczmy n slow w jeden ngram
+            string ngram = string.Join(" ", tokeny.GetRange(i, n).Select(t => t.slowo));
+            ngramy.Add(ngram);
+
+            // zapamietujemy pozycje pierwszego i ostatniego slowa w oryginalnym tekscie
+            if (!pozycje.ContainsKey(ngram))
+                pozycje[ngram] = (tokeny[i].od, tokeny[i + n - 1].do_);
+        }
+
+        return (ngramy, pozycje);
     }
 
     // oblicza wspolczynnik Jaccarda dla dwoch zbiorow n-gramow
@@ -175,62 +227,63 @@ class Server
         return (aDoB, bDoA);
     }
 
-    static List<string> PodzielNaZdania(string tekst)
+    // zamiast zdan zwraca liste zakresow (od, do) w oryginalnym tekscie
+    // dzieki temu GUI moze bezposrednio podswietlic fragmenty
+    static List<(int od, int do_)> ZnajdzPodobneZakresy(
+        Dictionary<string, (int od, int do_)> pozycje,
+        HashSet<string> wspolneNgramy)
     {
-        return Regex.Split(tekst, @"(?<=[\.!\?])\s+")
-            .Where(s => !string.IsNullOrWhiteSpace(s))
-            .ToList();
-    }
+        var zakresy = new List<(int od, int do_)>();
 
-    static List<string> ZnajdzPodobneZdania(string tekst, HashSet<string> wspolne, int n)
-    {
-        var zdania = PodzielNaZdania(tekst);
-        var wynik = new List<string>();
-
-        foreach (var zdanie in zdania)
+        foreach (var ngram in wspolneNgramy)
         {
-            var ngramy = GenerujNgramy(zdanie, n);
-
-            foreach (var ng in ngramy)
-            {
-                if (wspolne.Contains(ng))
-                {
-                    wynik.Add(zdanie);
-                    break;
-                }
-            }
+            if (pozycje.ContainsKey(ngram))
+                zakresy.Add(pozycje[ngram]);
         }
 
-        return wynik.Distinct().ToList();
+        // sortujemy po pozycji poczatku
+        zakresy.Sort((a, b) => a.od.CompareTo(b.od));
+
+        // laczymy zakresy ktore sie nakladaja lub stykaja
+        var polaczone = new List<(int od, int do_)>();
+        foreach (var zakres in zakresy)
+        {
+            if (polaczone.Count == 0 || zakres.od > polaczone.Last().do_)
+                polaczone.Add(zakres);
+            else
+                polaczone[polaczone.Count - 1] = (polaczone.Last().od, Math.Max(polaczone.Last().do_, zakres.do_));
+        }
+
+        return polaczone;
     }
 
     static string GenerujCSV(
-    string nazwaA,
-    string nazwaB,
-    double jaccard,
-    double aDoB,
-    double bDoA,
-    List<string> zdania1,
-    List<string> zdania2)
+        string nazwaA,
+        string nazwaB,
+        double jaccard,
+        double aDoB,
+        double bDoA,
+        List<(int od, int do_)> zakresy1,
+        List<(int od, int do_)> zakresy2)
     {
         StringBuilder sw = new StringBuilder();
 
         string fileA = Path.GetFileNameWithoutExtension(nazwaA);
         string fileB = Path.GetFileNameWithoutExtension(nazwaB);
 
-        sw.AppendLine("PlikA,PlikB,Jaccard,A->B,B->A,Typ,Dane");
+        sw.AppendLine("PlikA,PlikB,Jaccard,A->B,B->A,Typ,Od,Do");
 
         string jaccardStr = jaccard.ToString("F2", System.Globalization.CultureInfo.InvariantCulture);
         string aDoBStr = aDoB.ToString("F2", System.Globalization.CultureInfo.InvariantCulture);
         string bDoAStr = bDoA.ToString("F2", System.Globalization.CultureInfo.InvariantCulture);
 
-        sw.AppendLine($"{fileA},{fileB},{jaccardStr},{aDoBStr},{bDoAStr},STATYSTYKA,-");
+        sw.AppendLine($"{fileA},{fileB},{jaccardStr},{aDoBStr},{bDoAStr},STATYSTYKA,-,-");
 
-        foreach (var z in zdania1)
-            sw.AppendLine($"{fileA},{fileB},,,,ZDANIE_A,\"{z}\"");
+        foreach (var (od, do_) in zakresy1)
+            sw.AppendLine($"{fileA},{fileB},,,,ZAKRES_A,{od},{do_}");
 
-        foreach (var z in zdania2)
-            sw.AppendLine($"{fileA},{fileB},,,,ZDANIE_B,\"{z}\"");
+        foreach (var (od, do_) in zakresy2)
+            sw.AppendLine($"{fileA},{fileB},,,,ZAKRES_B,{od},{do_}");
 
         return sw.ToString();
     }
