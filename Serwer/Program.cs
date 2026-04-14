@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.IO;
 using System.Net;
 using System.Net.Sockets;
+using System.Text;
 using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
@@ -80,7 +81,11 @@ class Server
                 var zdania2 = ZnajdzPodobneZdania(tekst2, intersection, n);
 
                 // zapis do CSV
-                ZapiszPelnyCSV(nazwa1, nazwa2, Jaccard, aDoB, bDoA, zdania1, zdania2);
+                string csvContent = GenerujCSV(
+                    nazwa1, nazwa2,
+                    Jaccard, aDoB, bDoA,
+                    zdania1, zdania2
+                    );
 
                 //wysylanie wyniku do klienta, bo generowalo blad przy braku
                 writer.Write(Jaccard);
@@ -88,6 +93,7 @@ class Server
                 writer.Write(bDoA);
                 writer.Write(zdania1.Count);
                 writer.Write(zdania2.Count);
+                writer.Write(csvContent);
 
                 Console.WriteLine("[SERWER] Zakonczono!");
             }
@@ -198,47 +204,35 @@ class Server
         return wynik.Distinct().ToList();
     }
 
-    static void ZapiszPelnyCSV(
-        string nazwaA,
-        string nazwaB,
-        double jaccard,
-        double aDoB,
-        double bDoA,
-        List<string> zdania1,
-        List<string> zdania2)
+    static string GenerujCSV(
+    string nazwaA,
+    string nazwaB,
+    double jaccard,
+    double aDoB,
+    double bDoA,
+    List<string> zdania1,
+    List<string> zdania2)
     {
+        StringBuilder sw = new StringBuilder();
+
         string fileA = Path.GetFileNameWithoutExtension(nazwaA);
         string fileB = Path.GetFileNameWithoutExtension(nazwaB);
 
-        Directory.CreateDirectory("wyniki");
+        sw.AppendLine("PlikA,PlikB,Jaccard,A->B,B->A,Typ,Dane");
 
-        string timestamp = DateTime.Now.ToString("yyyyMMdd_HHmmss");
+        string jaccardStr = jaccard.ToString("F2", System.Globalization.CultureInfo.InvariantCulture);
+        string aDoBStr = aDoB.ToString("F2", System.Globalization.CultureInfo.InvariantCulture);
+        string bDoAStr = bDoA.ToString("F2", System.Globalization.CultureInfo.InvariantCulture);
 
-        string sciezka = Path.Combine("wyniki",
-            $"{fileA}_VS_{fileB}_{timestamp}.csv");
+        sw.AppendLine($"{fileA},{fileB},{jaccardStr},{aDoBStr},{bDoAStr},STATYSTYKA,-");
 
-        using (StreamWriter sw = new StreamWriter(sciezka))
-        {
-            sw.WriteLine("PlikA,PlikB,Jaccard,A->B,B->A,Typ,Dane");
+        foreach (var z in zdania1)
+            sw.AppendLine($"{fileA},{fileB},,,,ZDANIE_A,\"{z}\"");
 
-            // uzyj InvariantCulture zeby kropka byla separatorem dziesietnym a nie przecinek
-            string jaccardStr = jaccard.ToString("F2", System.Globalization.CultureInfo.InvariantCulture);
-            string aDoBStr = aDoB.ToString("F2", System.Globalization.CultureInfo.InvariantCulture);
-            string bDoAStr = bDoA.ToString("F2", System.Globalization.CultureInfo.InvariantCulture);
+        foreach (var z in zdania2)
+            sw.AppendLine($"{fileA},{fileB},,,,ZDANIE_B,\"{z}\"");
 
-            // statystyka
-            sw.WriteLine($"{fileA},{fileB},{jaccardStr},{aDoBStr},{bDoAStr},STATYSTYKA,-");
-
-            // zdania A
-            foreach (var z in zdania1)
-                sw.WriteLine($"{fileA},{fileB},,,,ZDANIE_A,\"{z}\"");
-
-            // zdania B
-            foreach (var z in zdania2)
-                sw.WriteLine($"{fileA},{fileB},,,,ZDANIE_B,\"{z}\"");
-        }
-
-        Console.WriteLine($"[SERWER] Zapisano CSV: {sciezka}");
+        return sw.ToString();
     }
 
     // sprawdza czy wynik przekracza prog plagiatu

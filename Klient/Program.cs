@@ -8,9 +8,10 @@ class Client
 {
     static List<string> adresySerwera = new List<string>
     {
-        "127.0.0.1"
-        // "192.168.1.x" // drugi komputer
-        // "192.168.1.y" // trzeci komputer
+        //"192.168.0.30",
+        "192.168.0.32",
+        "192.168.0.13"
+
     };
     static int port = 8001;
     static int n = 4;
@@ -23,11 +24,8 @@ class Client
         List<(string, string)> pary = GenerujPary(posortowane);
         WyswietlPary(pary);
 
-        foreach (var para in pary)
-        {
-            Console.WriteLine($"\n[KLIENT] Wysylam pare: {Path.GetFileName(para.Item1)} <-> {Path.GetFileName(para.Item2)}");
-            WyslijParyPlikow(adresySerwera[0], para.Item1, para.Item2);
-        }
+        var wyniki = RozdzielZadania(pary, posortowane);
+        WyswietlMacierz(wyniki, posortowane);
 
         // pozniej tutaj bedzie:
         // List<(string, string, double)> wyniki = RozdzielZadania(pary, posortowane);
@@ -161,6 +159,7 @@ class Client
                 double bDoA = reader.ReadDouble();
                 int liczbaPodobnychZdan1 = reader.ReadInt32();
                 int liczbaPodobnychZdan2 = reader.ReadInt32();
+                string csv = reader.ReadString(); 
 
                 Console.WriteLine("\n=== WYNIK POROWNANIA ===");
                 Console.WriteLine("Plik 1: " + Path.GetFileName(sciezka1));
@@ -184,55 +183,152 @@ class Client
     // rozdziela pary miedzy dostepne serwery
     static List<(string, string, double)> RozdzielZadania(List<(string, string)> pary, List<string> pliki)
     {
-        // TODO: podzielic pary na paczki wg grainSize
-        // TODO: przydzielic paczki do serwerow round-robin
-        // TODO: wyslac zadania wspolbieznie za pomoca ConcurrentQueue
-        // TODO: zebrac wyniki i zwrocic
-        return new List<(string, string, double)>();
+        List<Task<(string, string, double)>> taski = new List<Task<(string, string, double)>>();
+
+        for (int i = 0; i < pary.Count; i++)
+        {
+            var para = pary[i];
+            // i % adresySerwera.Count sugeruje startowy serwer, 
+            // aby nie wszystkie zadania uderzały w ten sam serwer na starcie
+            int startowyIndeks = i % adresySerwera.Count;
+
+            var task = Task.Run(() =>
+            {
+                return WyslijZadanie_Failover(startowyIndeks, para.Item1, para.Item2);
+            });
+
+            taski.Add(task);
+        }
+
+        Task.WaitAll(taski.ToArray());
+        return taski.Select(t => t.Result).ToList();
+    }
+    static (string, string, double) WyslijZadanie_Failover(int startIdx, string plikA, string plikB)
+    {
+        // Próbujemy po kolei każdego serwera z listy
+        for (int i = 0; i < adresySerwera.Count; i++)
+        {
+            int aktualnyIndeks = (startIdx + i) % adresySerwera.Count;
+            string adres = adresySerwera[aktualnyIndeks];
+
+            // Wykorzystujemy Twoją istniejącą funkcję WyslijZadanie
+            var wynik = WyslijZadanie(adres, plikA, plikB);
+
+            // Jeśli wynik jest poprawny (nie -1), zwracamy go i kończymy próby dla tej pary
+            if (wynik.Item3 >= 0)
+            {
+                return wynik;
+            }
+
+            Console.WriteLine($"[FAILOVER] Serwer {adres} zawiódł dla pary {Path.GetFileName(plikA)} vs {Path.GetFileName(plikB)}. Próbuję następny...");
+        }
+
+        // Jeśli pętla się skończyła i żaden serwer nie odpowiedział
+        return (plikA, plikB, -1.0);
     }
 
     // wysyla dwa pliki do serwera i odbiera wynik podobienstwa
     static (string, string, double) WyslijZadanie(string adres, string plikA, string plikB)
     {
+        // Klauzula using automatycznie zamknie połączenie, nawet jak wystąpi błąd
         try
         {
-            TcpClient klient = new TcpClient(adres, port);
-            NetworkStream stream = klient.GetStream();
-            BinaryReader reader = new BinaryReader(stream);
-            BinaryWriter writer = new BinaryWriter(stream);
+            using (TcpClient klient = new TcpClient())
+            {
+                // Ustawiamy krótkie timeouty (np. 5 sekund)
+                klient.ReceiveTimeout = 5000;
+                klient.SendTimeout = 5000;
 
-            writer.Write(n);
-            writer.Write(grainSize);
+                // Próba połączenia
+                klient.Connect(adres, port);
 
-            WyslijPlik(writer, plikA);
-            WyslijPlik(writer, plikB);
+                using (NetworkStream stream = klient.GetStream())
+                using (BinaryWriter writer = new BinaryWriter(stream))
+                using (BinaryReader reader = new BinaryReader(stream))
+                {
+                    // Wysyłanie parametrów
+                    writer.Write(n);
+                    writer.Write(grainSize);
 
-            string nazwaA = reader.ReadString();
-            string nazwaB = reader.ReadString();
-            double podobienstwo = reader.ReadDouble();
+                    // Wysyłanie plików
+                    WyslijPlik(writer, plikA);
+                    WyslijPlik(writer, plikB);
+                    writer.Flush();
 
-            klient.Close();
-            return (nazwaA, nazwaB, podobienstwo);
+                    // Odbieranie danych - DODAJ TRY-CATCH tutaj, jeśli serwer może wysłać śmieci
+                    // Musimy odczytać WSZYSTKO co serwer wysłał, 
+                    // żeby nie zostawić śmieci w buforze (nawet jeśli nie używasz tych zmiennych)
+                    double jaccard = reader.ReadDouble();
+                    double aDoB = reader.ReadDouble();
+                    double bDoA = reader.ReadDouble();
+                    int liczba1 = reader.ReadInt32();
+                    int liczba2 = reader.ReadInt32();
+                    string csv = reader.ReadString();
+                    
+                    ZapiszCSVLokalnie(plikA, plikB, csv);
+                    return (plikA, plikB, jaccard);
+                }
+            }
         }
-        catch (Exception e)
+        catch (SocketException ex)
         {
-            Console.WriteLine("Blad polaczenia z " + adres + ": " + e.Message);
-            // TODO: ponowna proba z innym serwerem
+            Console.WriteLine($"[BŁĄD SIECI] {adres}: Serwer jest wyłączony lub port zablokowany.");
             return (plikA, plikB, -1);
         }
+        catch (IOException ex)
+        {
+            Console.WriteLine($"[BŁĄD TRANSMISJI] {adres}: Serwer zerwał połączenie w trakcie wysyłania.");
+            return (plikA, plikB, -1);
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[BŁĄD NIEOCZEKIWANY] {adres}: {ex.Message}");
+            return (plikA, plikB, -1);
+        }
+    }
+
+    static void ZapiszCSVLokalnie(string plikA, string plikB, string csv)
+    {
+        string folder = "Raporty";
+        Directory.CreateDirectory(folder);
+
+        string nameA = Path.GetFileNameWithoutExtension(plikA);
+        string nameB = Path.GetFileNameWithoutExtension(plikB);
+
+        string path = Path.Combine(folder,
+            $"{nameA}_VS_{nameB}_{DateTime.Now:yyyyMMdd_HHmmss}.csv");
+
+        File.WriteAllText(path, csv);
+
+        Console.WriteLine($"[KLIENT] Zapisano raport: {path}");
     }
 
     // wyswietla wyniki w konsoli
     static void WyswietlMacierz(List<(string, string, double)> wyniki, List<string> pliki)
     {
-        // TODO: wyswietlic naglowki kolumn
-        // TODO: dla kazdej pary znalezc wynik i wyswietlic
-        // TODO: oznaczyc pary powyzej progu jako [PLAGIAT?]
         Console.WriteLine("\n=== WYNIKI ===");
         foreach (var (a, b, podobienstwo) in wyniki)
         {
-            string status = podobienstwo >= prog ? " [PLAGIAT?]" : "";
-            Console.WriteLine(a + " vs " + b + " = " + podobienstwo + "%" + status);
+            string nazwaA = Path.GetFileName(a);
+            string nazwaB = Path.GetFileName(b);
+
+            // 1. Obsługa tekstu wyniku (procent lub błąd)
+            string wynikTekst = podobienstwo < 0 ? "BŁĄD POŁĄCZENIA" : $"{podobienstwo:F2}%";
+
+            // 2. Logika statusu plagiatu (tylko jeśli nie ma błędu)
+            string status = (podobienstwo >= prog && podobienstwo >= 0) ? " [PLAGIAT?]" : "";
+
+            // 3. Wyświetlanie z opcjonalnym kolorem dla błędów
+            if (podobienstwo < 0)
+            {
+                Console.ForegroundColor = ConsoleColor.Red;
+                Console.WriteLine($"{nazwaA} vs {nazwaB} = {wynikTekst}");
+                Console.ResetColor();
+            }
+            else
+            {
+                Console.WriteLine($"{nazwaA} vs {nazwaB} = {wynikTekst}{status}");
+            }
         }
     }
 
