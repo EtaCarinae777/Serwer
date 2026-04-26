@@ -12,6 +12,8 @@ namespace GUI
 {
     public partial class Form1 : Form
     {
+        private System.Diagnostics.Stopwatch stoper = new System.Diagnostics.Stopwatch();
+        private Timer timerInterfejsu;
         private List<WynikPary> wczytaneWyniki = new List<WynikPary>();
         private List<string> _wybranePliki = new List<string>();
 
@@ -19,6 +21,13 @@ namespace GUI
         {
             InitializeComponent();
             listPary.SelectedIndexChanged += ListPary_SelectedIndexChanged;
+            listPary.DrawMode = DrawMode.OwnerDrawFixed;
+            listPary.DrawItem += ListPary_DrawItem;
+            timerInterfejsu = new Timer();
+            timerInterfejsu.Interval = 1000; // aktualizacja co sekundę
+            timerInterfejsu.Tick += (s, e) => {
+                lblTimer.Text = $"Czas: {stoper.Elapsed:hh\\:mm\\:ss}";
+            };
         }
 
         // ===================================================================
@@ -61,6 +70,52 @@ namespace GUI
             lblWybranePliki.Text = $"Wybrano {_wybranePliki.Count} plików";
         }
 
+        private void ListPary_DrawItem(object sender, DrawItemEventArgs e)
+        {
+            if (e.Index < 0 || e.Index >= wczytaneWyniki.Count) return;
+
+            WynikPary wynik = wczytaneWyniki[e.Index];
+            double jaccard = wynik.jaccard;
+            double prog = (double)numProg.Value;
+
+            // Tło — białe zawsze, ciemniejsze gdy zaznaczony
+            Color tlo = (e.State & DrawItemState.Selected) == DrawItemState.Selected
+                ? Color.FromArgb(220, 220, 220)
+                : Color.White;
+
+            e.Graphics.FillRectangle(new SolidBrush(tlo), e.Bounds);
+
+            // Kolor tekstu — gradient czerwony wg % dla plagiatów, zielony dla czystych
+            Color kolorTekstu;
+            if (jaccard >= prog)
+            {
+                // 30% → jasny pomarańczowoczerwony, 100% → intensywna czerwień
+                double t = Math.Min((jaccard - prog) / (100.0 - prog), 1.0);
+                int r = 255;
+                int g = (int)(140 * (1.0 - t)); // 140 → 0
+                int b = 0;
+                kolorTekstu = Color.FromArgb(r, g, b);
+            }
+            else
+            {
+                // czyste — ciemna zieleń
+                kolorTekstu = Color.FromArgb(0, 140, 0);
+            }
+
+            string tekst = Path.GetFileName(wynik.plikA) + " vs " +
+                           Path.GetFileName(wynik.plikB) + "  —  " +
+                           jaccard.ToString("F2") + "%" +
+                           (jaccard >= prog ? " ⚠" : "");
+
+            e.Graphics.DrawString(tekst, e.Font, new SolidBrush(kolorTekstu),
+                e.Bounds.X + 2, e.Bounds.Y + 2);
+
+            e.DrawFocusRectangle();
+        }
+
+
+
+
         // ===================================================================
         // NOWE: Analiza — logika przeniesiona z Klient/Program.cs
         // ===================================================================
@@ -74,7 +129,6 @@ namespace GUI
                 return;
             }
 
-            // Odczytaj adresy serwerów z pola tekstowego
             List<string> adresy = txtAdresy.Lines
                 .Select(l => l.Trim())
                 .Where(l => l.Length > 0)
@@ -87,12 +141,12 @@ namespace GUI
                 return;
             }
 
+            // Pobranie parametrów z UI
             int n = (int)numN.Value;
             int grainSize = (int)numGrainSize.Value;
             double prog = (double)numProg.Value;
             int port = 8001;
 
-            // Sortuj pliki malejąco wg rozmiaru (jak w Kliencie)
             var posortowane = _wybranePliki
                 .Where(f => File.Exists(f))
                 .OrderByDescending(f => new FileInfo(f).Length)
@@ -100,7 +154,7 @@ namespace GUI
 
             var pary = GenerujPary(posortowane);
 
-            // Przygotuj UI
+            // Przygotowanie UI
             btnAnalyzuj.Enabled = false;
             btnWybierzPliki.Enabled = false;
             progressBar.Minimum = 0;
@@ -109,9 +163,19 @@ namespace GUI
             wczytaneWyniki.Clear();
             listPary.Items.Clear();
 
-            int wykonane = 0;
+            // ==========================================
+            // START LICZNIKA
+            // ==========================================
+            stoper.Restart();
+            if (timerInterfejsu == null)
+            {
+                timerInterfejsu = new Timer { Interval = 1000 };
+                timerInterfejsu.Tick += (s, ev) => lblTimer.Text = $"Czas pracy: {stoper.Elapsed:hh\\:mm\\:ss}";
+            }
+            timerInterfejsu.Start();
+            // ==========================================
 
-            // Kolejka par + zadania per serwer (jak RozdzielZadania w Kliencie)
+            int wykonane = 0;
             var kolejka = new System.Collections.Concurrent.ConcurrentQueue<(string, string)>();
             foreach (var para in pary) kolejka.Enqueue(para);
 
@@ -135,6 +199,7 @@ namespace GUI
                     {
                         while (kolejka.TryDequeue(out var para))
                         {
+                            // Wysyłanie zadania do serwerów z mechanizmem failover
                             var wynik = WyslijZadanieFailover(
                                 adresy, idx, port, para.Item1, para.Item2, n, grainSize);
 
@@ -150,7 +215,15 @@ namespace GUI
                 Task.WaitAll(taski.ToArray());
             });
 
-            // Załaduj wyniki bezpośrednio — bez pośrednictwa pliku JSON
+            // ==========================================
+            // STOP LICZNIKA
+            // ==========================================
+            stoper.Stop();
+            timerInterfejsu.Stop();
+            lblTimer.Text = $"Czas całkowity: {stoper.Elapsed:hh\\:mm\\:ss}";
+            // ==========================================
+
+            // Porządkowanie wyników i aktualizacja listy
             wczytaneWyniki = wynikiBag
                 .OrderByDescending(w => w.jaccard)
                 .ToList();
@@ -393,12 +466,7 @@ namespace GUI
         {
             listPary.Items.Clear();
             foreach (var wynik in wczytaneWyniki)
-            {
-                string wpis = Path.GetFileName(wynik.plikA) + " vs " +
-                              Path.GetFileName(wynik.plikB) + " — " +
-                              wynik.jaccard.ToString("F2") + "%";
-                listPary.Items.Add(wpis);
-            }
+                listPary.Items.Add(wynik.plikA); // tekst nieważny, DrawItem go nadpisuje
         }
 
         private void ListPary_SelectedIndexChanged(object sender, EventArgs e)

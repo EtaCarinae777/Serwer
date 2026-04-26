@@ -23,8 +23,7 @@
             this.lblNazwaB = new System.Windows.Forms.Label();
             this.btnWczytaj = new System.Windows.Forms.Button();
             this.lblFolder = new System.Windows.Forms.Label();
-
-            // === NOWE KONTROLKI ===
+            this.lblTimer = new System.Windows.Forms.Label();
             this.btnWybierzPliki = new System.Windows.Forms.Button();
             this.txtAdresy = new System.Windows.Forms.TextBox();
             this.lblAdresy = new System.Windows.Forms.Label();
@@ -56,6 +55,15 @@
                 System.Windows.Forms.AnchorStyles.Bottom |
                 System.Windows.Forms.AnchorStyles.Left));
             this.panelLewy.Name = "panelLewy";
+
+            // ---------------------------------------------------------------
+            //stoper
+            // ---------------------------------------------------------------
+            this.lblTimer.Location = new System.Drawing.Point(4, 374); // Pozycja pod statusem
+            this.lblTimer.Size = new System.Drawing.Size(200, 16);
+            this.lblTimer.Name = "lblTimer";
+            this.lblTimer.Text = "Czas: 00:00:00";
+            this.lblTimer.Font = new System.Drawing.Font("Segoe UI", 8f, System.Drawing.FontStyle.Bold);
 
             // ---------------------------------------------------------------
             // btnWybierzPliki
@@ -232,6 +240,14 @@
             this.panelLewy.Controls.Add(this.btnWczytaj);
             this.panelLewy.Controls.Add(this.lblPary);
             this.panelLewy.Controls.Add(this.listPary);
+            this.panelLewy.Controls.Add(this.lblTimer);
+
+            //----------------------------------------------------------------
+            //stoper
+            //----------------------------------------------------------------
+
+
+
 
             // ---------------------------------------------------------------
             // lblNazwaA
@@ -302,6 +318,12 @@
 
             this.ResumeLayout(false);
             this.PerformLayout();
+
+            //---------------------------------------------------------------
+            //Timer
+            // ---------------------------------------------------------------
+
+
         }
 
         private System.Windows.Forms.ListBox listPary;
@@ -326,5 +348,6 @@
         private System.Windows.Forms.ProgressBar progressBar;
         private System.Windows.Forms.Label lblStatus;
         private System.Windows.Forms.Panel panelLewy;
+        private System.Windows.Forms.Label lblTimer;
     }
 }
