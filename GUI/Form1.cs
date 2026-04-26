@@ -19,6 +19,8 @@ namespace GUI
         {
             InitializeComponent();
             listPary.SelectedIndexChanged += ListPary_SelectedIndexChanged;
+            listPary.DrawMode = DrawMode.OwnerDrawFixed;
+            listPary.DrawItem += ListPary_DrawItem;
         }
 
         // ===================================================================
@@ -59,6 +61,48 @@ namespace GUI
 
             _wybranePliki = new List<string>(dialog.FileNames);
             lblWybranePliki.Text = $"Wybrano {_wybranePliki.Count} plików";
+        }
+        private void ListPary_DrawItem(object sender, DrawItemEventArgs e)
+        {
+            if (e.Index < 0 || e.Index >= wczytaneWyniki.Count) return;
+
+            WynikPary wynik = wczytaneWyniki[e.Index];
+            double jaccard = wynik.jaccard;
+            double prog = (double)numProg.Value;
+
+            // Tło — białe zawsze, ciemniejsze gdy zaznaczony
+            Color tlo = (e.State & DrawItemState.Selected) == DrawItemState.Selected
+                ? Color.FromArgb(220, 220, 220)
+                : Color.White;
+
+            e.Graphics.FillRectangle(new SolidBrush(tlo), e.Bounds);
+
+            // Kolor tekstu — gradient czerwony wg % dla plagiatów, zielony dla czystych
+            Color kolorTekstu;
+            if (jaccard >= prog)
+            {
+                // 30% → jasny pomarańczowoczerwony, 100% → intensywna czerwień
+                double t = Math.Min((jaccard - prog) / (100.0 - prog), 1.0);
+                int r = 255;
+                int g = (int)(140 * (1.0 - t)); // 140 → 0
+                int b = 0;
+                kolorTekstu = Color.FromArgb(r, g, b);
+            }
+            else
+            {
+                // czyste — ciemna zieleń
+                kolorTekstu = Color.FromArgb(0, 140, 0);
+            }
+
+            string tekst = Path.GetFileName(wynik.plikA) + " vs " +
+                           Path.GetFileName(wynik.plikB) + "  —  " +
+                           jaccard.ToString("F2") + "%" +
+                           (jaccard >= prog ? " ⚠" : "");
+
+            e.Graphics.DrawString(tekst, e.Font, new SolidBrush(kolorTekstu),
+                e.Bounds.X + 2, e.Bounds.Y + 2);
+
+            e.DrawFocusRectangle();
         }
 
         // ===================================================================
@@ -393,12 +437,7 @@ namespace GUI
         {
             listPary.Items.Clear();
             foreach (var wynik in wczytaneWyniki)
-            {
-                string wpis = Path.GetFileName(wynik.plikA) + " vs " +
-                              Path.GetFileName(wynik.plikB) + " — " +
-                              wynik.jaccard.ToString("F2") + "%";
-                listPary.Items.Add(wpis);
-            }
+                listPary.Items.Add(wynik.plikA); // tekst nieważny, DrawItem go nadpisuje
         }
 
         private void ListPary_SelectedIndexChanged(object sender, EventArgs e)
