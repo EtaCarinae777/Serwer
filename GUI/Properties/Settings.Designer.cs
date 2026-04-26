@@ -8,7 +8,7 @@
 // </auto-generated>
 //------------------------------------------------------------------------------
 
-namespace KlientGUI.Properties
+namespace GUI.Properties
 {
 
 

@@ -9,6 +9,7 @@ using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
 using static System.Net.Mime.MediaTypeNames;
+using Newtonsoft.Json;
 
 class Server
 {
@@ -115,7 +116,15 @@ class Server
                     writer.Write(do_);
                 }
 
+                // generujemy JSON z trescia plikow i zakresami
+                string jsonContent = GenerujJSON(
+                    nazwa1, nazwa2,
+                    tekst1, tekst2,
+                    Jaccard, aDoB, bDoA,
+                    zakresy1, zakresy2);
+
                 writer.Write(csvContent);
+                writer.Write(jsonContent);
                 writer.Write(czasObliczenMs);
 
                 Console.WriteLine("[SERWER] Zakonczono!");
@@ -286,6 +295,34 @@ class Server
             sw.AppendLine($"{fileA},{fileB},,,,ZAKRES_B,{od},{do_}");
 
         return sw.ToString();
+    }
+
+    static string GenerujJSON(
+    string nazwaA,
+    string nazwaB,
+    string tekstA,
+    string tekstB,
+    double jaccard,
+    double aDoB,
+    double bDoA,
+    List<(int od, int do_)> zakresy1,
+    List<(int od, int do_)> zakresy2)
+    {
+        // budujemy obiekt jako slownik
+        var dane = new
+        {
+            plikA = nazwaA,
+            plikB = nazwaB,
+            jaccard = Math.Round(jaccard, 2),
+            aDoB = Math.Round(aDoB, 2),
+            bDoA = Math.Round(bDoA, 2),
+            tekstA = tekstA,
+            tekstB = tekstB,
+            zakresy1 = zakresy1.Select(z => new { od = z.od, do_ = z.do_ }).ToList(),
+            zakresy2 = zakresy2.Select(z => new { od = z.od, do_ = z.do_ }).ToList()
+        };
+
+        return Newtonsoft.Json.JsonConvert.SerializeObject(dane, Newtonsoft.Json.Formatting.Indented);
     }
 
     // sprawdza czy wynik przekracza prog plagiatu

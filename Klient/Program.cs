@@ -288,6 +288,7 @@ class Client
                         zakresy2.Add((reader.ReadInt32(), reader.ReadInt32()));
 
                     string csv = reader.ReadString();
+                    string json = reader.ReadString();
                     long czasObliczenSerwera = reader.ReadInt64();
 
                     stoperCalkowity.Stop();
@@ -301,6 +302,7 @@ class Client
                     Console.WriteLine($"[ZAKRESY] Plik 2: {liczbaZakresow2} fragmentow");
 
                     ZapiszCSVLokalnie(plikA, plikB, csv);
+                    ZapiszJSONLokalnie(plikA, plikB, json);
                     ZapiszStatystyki(adres, plikA, plikB, jaccard,
                                      czasObliczenSerwera, czasTransmisji, czasCalkowity);
 
@@ -473,5 +475,20 @@ class Client
         Console.WriteLine("[KLIENT] Zapisano podsumowanie: " + plik);
     }
 
+    static void ZapiszJSONLokalnie(string plikA, string plikB, string json)
+    {
+        string folder = "Raporty";
+        Directory.CreateDirectory(folder);
+
+        string nameA = Path.GetFileNameWithoutExtension(plikA);
+        string nameB = Path.GetFileNameWithoutExtension(plikB);
+
+        string path = Path.Combine(folder,
+            $"{nameA}_VS_{nameB}_{DateTime.Now:yyyyMMdd_HHmmss}.json");
+
+        File.WriteAllText(path, json);
+
+        Console.WriteLine($"[KLIENT] Zapisano JSON: {path}");
+    }
 }
 
