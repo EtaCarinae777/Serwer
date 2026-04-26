@@ -2,6 +2,9 @@
 using System.Collections.Generic;
 using System.Drawing;
 using System.IO;
+using System.Linq;
+using System.Net.Sockets;
+using System.Threading.Tasks;
 using System.Windows.Forms;
 using Newtonsoft.Json;
 
@@ -10,12 +13,17 @@ namespace GUI
     public partial class Form1 : Form
     {
         private List<WynikPary> wczytaneWyniki = new List<WynikPary>();
+        private List<string> _wybranePliki = new List<string>();
 
         public Form1()
         {
             InitializeComponent();
             listPary.SelectedIndexChanged += ListPary_SelectedIndexChanged;
         }
+
+        // ===================================================================
+        // Modele danych
+        // ===================================================================
 
         private class WynikPary
         {
@@ -36,6 +44,285 @@ namespace GUI
             public int do_ { get; set; }
         }
 
+        // ===================================================================
+        // NOWE: Wybieranie plików
+        // ===================================================================
+
+        private void btnWybierzPliki_Click(object sender, EventArgs e)
+        {
+            OpenFileDialog dialog = new OpenFileDialog();
+            dialog.Multiselect = true;
+            dialog.Title = "Wybierz pliki do analizy";
+            dialog.Filter = "Wszystkie pliki (*.*)|*.*";
+
+            if (dialog.ShowDialog() != DialogResult.OK) return;
+
+            _wybranePliki = new List<string>(dialog.FileNames);
+            lblWybranePliki.Text = $"Wybrano {_wybranePliki.Count} plików";
+        }
+
+        // ===================================================================
+        // NOWE: Analiza — logika przeniesiona z Klient/Program.cs
+        // ===================================================================
+
+        private async void btnAnalyzuj_Click(object sender, EventArgs e)
+        {
+            if (_wybranePliki.Count < 2)
+            {
+                MessageBox.Show("Wybierz co najmniej 2 pliki!", "Brak plików",
+                    MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+
+            // Odczytaj adresy serwerów z pola tekstowego
+            List<string> adresy = txtAdresy.Lines
+                .Select(l => l.Trim())
+                .Where(l => l.Length > 0)
+                .ToList();
+
+            if (adresy.Count == 0)
+            {
+                MessageBox.Show("Podaj co najmniej jeden adres serwera!", "Brak serwerów",
+                    MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+
+            int n = (int)numN.Value;
+            int grainSize = (int)numGrainSize.Value;
+            double prog = (double)numProg.Value;
+            int port = 8001;
+
+            // Sortuj pliki malejąco wg rozmiaru (jak w Kliencie)
+            var posortowane = _wybranePliki
+                .Where(f => File.Exists(f))
+                .OrderByDescending(f => new FileInfo(f).Length)
+                .ToList();
+
+            var pary = GenerujPary(posortowane);
+
+            // Przygotuj UI
+            btnAnalyzuj.Enabled = false;
+            btnWybierzPliki.Enabled = false;
+            progressBar.Minimum = 0;
+            progressBar.Maximum = pary.Count;
+            progressBar.Value = 0;
+            wczytaneWyniki.Clear();
+            listPary.Items.Clear();
+
+            int wykonane = 0;
+
+            // Kolejka par + zadania per serwer (jak RozdzielZadania w Kliencie)
+            var kolejka = new System.Collections.Concurrent.ConcurrentQueue<(string, string)>();
+            foreach (var para in pary) kolejka.Enqueue(para);
+
+            var wynikiBag = new System.Collections.Concurrent.ConcurrentBag<WynikPary>();
+
+            var progress = new Progress<string>(komunikat =>
+            {
+                wykonane++;
+                progressBar.Value = Math.Min(wykonane, pary.Count);
+                lblStatus.Text = komunikat;
+            });
+
+            await Task.Run(() =>
+            {
+                var taski = new List<Task>();
+
+                for (int i = 0; i < adresy.Count; i++)
+                {
+                    int idx = i;
+                    taski.Add(Task.Run(() =>
+                    {
+                        while (kolejka.TryDequeue(out var para))
+                        {
+                            var wynik = WyslijZadanieFailover(
+                                adresy, idx, port, para.Item1, para.Item2, n, grainSize);
+
+                            if (wynik != null)
+                                wynikiBag.Add(wynik);
+
+                            ((IProgress<string>)progress).Report(
+                                $"{Path.GetFileName(para.Item1)} vs {Path.GetFileName(para.Item2)}");
+                        }
+                    }));
+                }
+
+                Task.WaitAll(taski.ToArray());
+            });
+
+            // Załaduj wyniki bezpośrednio — bez pośrednictwa pliku JSON
+            wczytaneWyniki = wynikiBag
+                .OrderByDescending(w => w.jaccard)
+                .ToList();
+
+            OdswiezListe();
+
+            lblStatus.Text = $"Gotowe! Przeanalizowano {wczytaneWyniki.Count} par.";
+            btnAnalyzuj.Enabled = true;
+            btnWybierzPliki.Enabled = true;
+
+            int plagiatow = wczytaneWyniki.Count(w => w.jaccard >= prog);
+            if (plagiatow > 0)
+                lblStatus.Text += $" ⚠ Wykryto {plagiatow} plagiatów!";
+        }
+
+        // ===================================================================
+        // Logika sieciowa (przeniesiona z Klient/Program.cs)
+        // ===================================================================
+
+        private WynikPary WyslijZadanieFailover(
+            List<string> adresy, int startIdx, int port,
+            string plikA, string plikB, int n, int grainSize)
+        {
+            for (int i = 0; i < adresy.Count; i++)
+            {
+                int idx = (startIdx + i) % adresy.Count;
+                var wynik = WyslijZadanie(adresy[idx], port, plikA, plikB, n, grainSize);
+                if (wynik != null) return wynik;
+            }
+            return null;
+        }
+
+        private WynikPary WyslijZadanie(
+            string adres, int port,
+            string plikA, string plikB,
+            int n, int grainSize)
+        {
+            try
+            {
+                using (TcpClient klient = new TcpClient())
+                {
+                    klient.ReceiveTimeout = 30000;
+                    klient.SendTimeout = 30000;
+                    klient.Connect(adres, port);
+
+                    using (NetworkStream stream = klient.GetStream())
+                    using (BinaryWriter writer = new BinaryWriter(stream))
+                    using (BinaryReader reader = new BinaryReader(stream))
+                    {
+                        // Parametry
+                        writer.Write(n);
+                        writer.Write(grainSize);
+
+                        // Pliki
+                        WyslijPlik(writer, plikA);
+                        WyslijPlik(writer, plikB);
+                        writer.Flush();
+
+                        // Odbiór wyników
+                        double jaccard = reader.ReadDouble();
+                        double aDoB = reader.ReadDouble();
+                        double bDoA = reader.ReadDouble();
+
+                        int liczbaZakresow1 = reader.ReadInt32();
+                        var zakresy1 = new List<Zakres>();
+                        for (int i = 0; i < liczbaZakresow1; i++)
+                            zakresy1.Add(new Zakres { od = reader.ReadInt32(), do_ = reader.ReadInt32() });
+
+                        int liczbaZakresow2 = reader.ReadInt32();
+                        var zakresy2 = new List<Zakres>();
+                        for (int i = 0; i < liczbaZakresow2; i++)
+                            zakresy2.Add(new Zakres { od = reader.ReadInt32(), do_ = reader.ReadInt32() });
+
+                        string csv = reader.ReadString();
+                        string json = reader.ReadString();
+                        reader.ReadInt64(); // czasObliczenSerwera — nieużywany tu
+
+                        // Opcjonalnie zapisz raporty na dysk
+                        ZapiszCSVLokalnie(plikA, plikB, csv);
+                        ZapiszJSONLokalnie(plikA, plikB, json);
+
+                        // Odczytaj tekst z JSON żeby pokazać w rtb
+                        WynikPary wynikZJson = null;
+                        try { wynikZJson = JsonConvert.DeserializeObject<WynikPary>(json); }
+                        catch { }
+
+                        return new WynikPary
+                        {
+                            plikA = plikA,
+                            plikB = plikB,
+                            jaccard = jaccard,
+                            aDoB = aDoB,
+                            bDoA = bDoA,
+                            tekstA = wynikZJson?.tekstA ?? File.ReadAllText(plikA),
+                            tekstB = wynikZJson?.tekstB ?? File.ReadAllText(plikB),
+                            zakresy1 = zakresy1,
+                            zakresy2 = zakresy2
+                        };
+                    }
+                }
+            }
+            catch (SocketException)
+            {
+                MessageBox.Show($"Serwer {adres} jest niedostępny.", "Błąd sieci",
+                    MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return null;
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show($"Błąd: {ex.Message}", "Błąd",
+                    MessageBoxButtons.OK, MessageBoxIcon.Error);
+                return null;
+            }
+        }
+
+        private void WyslijPlik(BinaryWriter writer, string sciezka)
+        {
+            byte[] dane = File.ReadAllBytes(sciezka);
+            writer.Write(Path.GetFileName(sciezka));
+            writer.Write((long)dane.Length);
+            writer.Write(dane);
+        }
+
+        // ===================================================================
+        // Pomocnicze — generowanie par
+        // ===================================================================
+
+        private List<(string, string)> GenerujPary(List<string> pliki)
+        {
+            var pary = new List<(string, string)>();
+            for (int i = 0; i < pliki.Count; i++)
+                for (int j = i + 1; j < pliki.Count; j++)
+                    pary.Add((pliki[i], pliki[j]));
+            return pary;
+        }
+
+        // ===================================================================
+        // Zapis raportów na dysk (identycznie jak w Kliencie)
+        // ===================================================================
+
+        private void ZapiszCSVLokalnie(string plikA, string plikB, string csv)
+        {
+            try
+            {
+                Directory.CreateDirectory("Raporty");
+                string path = Path.Combine("Raporty",
+                    $"{Path.GetFileNameWithoutExtension(plikA)}_VS_" +
+                    $"{Path.GetFileNameWithoutExtension(plikB)}_" +
+                    $"{DateTime.Now:yyyyMMdd_HHmmss}.csv");
+                File.WriteAllText(path, csv);
+            }
+            catch { /* nie przerywaj analizy jeśli zapis się nie uda */ }
+        }
+
+        private void ZapiszJSONLokalnie(string plikA, string plikB, string json)
+        {
+            try
+            {
+                Directory.CreateDirectory("Raporty");
+                string path = Path.Combine("Raporty",
+                    $"{Path.GetFileNameWithoutExtension(plikA)}_VS_" +
+                    $"{Path.GetFileNameWithoutExtension(plikB)}_" +
+                    $"{DateTime.Now:yyyyMMdd_HHmmss}.json");
+                File.WriteAllText(path, json);
+            }
+            catch { }
+        }
+
+        // ===================================================================
+        // Wczytywanie wyników z folderu (istniejąca funkcja)
+        // ===================================================================
+
         private void btnWczytaj_Click(object sender, EventArgs e)
         {
             FolderBrowserDialog dialog = new FolderBrowserDialog();
@@ -53,7 +340,7 @@ namespace GUI
 
             if (plikiJson.Length == 0)
             {
-                MessageBox.Show("Nie znaleziono zadnych plikow JSON w tym folderze!");
+                MessageBox.Show("Nie znaleziono żadnych plików JSON w tym folderze!");
                 return;
             }
 
@@ -71,17 +358,18 @@ namespace GUI
                 }
             }
 
-            // sortujemy po Jaccardzie malejaco
             wczytaneWyniki.Sort((a, b) => b.jaccard.CompareTo(a.jaccard));
             OdswiezListe();
-
-            MessageBox.Show("Wczytano " + wczytaneWyniki.Count + " wynikow!");
+            MessageBox.Show("Wczytano " + wczytaneWyniki.Count + " wyników!");
         }
+
+        // ===================================================================
+        // UI — lista i podświetlanie
+        // ===================================================================
 
         private void OdswiezListe()
         {
             listPary.Items.Clear();
-
             foreach (var wynik in wczytaneWyniki)
             {
                 string wpis = Path.GetFileName(wynik.plikA) + " vs " +
@@ -132,7 +420,5 @@ namespace GUI
 
             rtb.Select(0, 0);
         }
-
-      
     }
 }
