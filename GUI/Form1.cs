@@ -184,32 +184,35 @@ namespace GUI
         }
 
         private WynikPary WyslijZadanie(
-            string adres, int port,
-            string plikA, string plikB,
-            int n, int grainSize)
+     string adres, int port,
+     string plikA, string plikB,
+     int n, int grainSize)
         {
             try
             {
                 using (TcpClient klient = new TcpClient())
                 {
+                    // timeout na samo Connect — bez tego może wisieć w nieskończoność
+                    bool connected = klient.ConnectAsync(adres, port).Wait(3000);
+                    if (!connected)
+                    {
+                        ZapiszLog($"[TIMEOUT] Serwer {adres}:{port} nie odpowiedział w ciągu 3s.");
+                        return null;
+                    }
+
                     klient.ReceiveTimeout = 30000;
                     klient.SendTimeout = 30000;
-                    klient.Connect(adres, port);
 
                     using (NetworkStream stream = klient.GetStream())
                     using (BinaryWriter writer = new BinaryWriter(stream))
                     using (BinaryReader reader = new BinaryReader(stream))
                     {
-                        // Parametry
                         writer.Write(n);
                         writer.Write(grainSize);
-
-                        // Pliki
                         WyslijPlik(writer, plikA);
                         WyslijPlik(writer, plikB);
                         writer.Flush();
 
-                        // Odbiór wyników
                         double jaccard = reader.ReadDouble();
                         double aDoB = reader.ReadDouble();
                         double bDoA = reader.ReadDouble();
@@ -226,16 +229,13 @@ namespace GUI
 
                         string csv = reader.ReadString();
                         string json = reader.ReadString();
-                        reader.ReadInt64(); // czasObliczenSerwera — nieużywany tu
+                        reader.ReadInt64();
 
-                        // Opcjonalnie zapisz raporty na dysk
                         ZapiszCSVLokalnie(plikA, plikB, csv);
                         ZapiszJSONLokalnie(plikA, plikB, json);
 
-                        // Odczytaj tekst z JSON żeby pokazać w rtb
                         WynikPary wynikZJson = null;
-                        try { wynikZJson = JsonConvert.DeserializeObject<WynikPary>(json); }
-                        catch { }
+                        try { wynikZJson = JsonConvert.DeserializeObject<WynikPary>(json); } catch { }
 
                         return new WynikPary
                         {
@@ -252,18 +252,40 @@ namespace GUI
                     }
                 }
             }
-            catch (SocketException)
+            catch (SocketException ex)
             {
-                MessageBox.Show($"Serwer {adres} jest niedostępny.", "Błąd sieci",
-                    MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                ZapiszLog($"[SOCKET ERROR] Serwer {adres}:{port} — {ex.Message}");
+                return null;
+            }
+            catch (IOException ex)
+            {
+                ZapiszLog($"[IO ERROR] Serwer {adres}:{port} zerwał połączenie — {ex.Message}");
                 return null;
             }
             catch (Exception ex)
             {
-                MessageBox.Show($"Błąd: {ex.Message}", "Błąd",
-                    MessageBoxButtons.OK, MessageBoxIcon.Error);
+                ZapiszLog($"[ERROR] Serwer {adres}:{port} — {ex.Message}");
                 return null;
             }
+        }
+
+        // Dopisz tę metodę obok pozostałych pomocniczych:
+        private static readonly object _logLock = new object();
+
+        private void ZapiszLog(string komunikat)
+        {
+            try
+            {
+                Directory.CreateDirectory("Raporty");
+                string plik = Path.Combine("Raporty", "errors.log");
+                string linia = $"{DateTime.Now:yyyy-MM-dd HH:mm:ss} {komunikat}";
+
+                lock (_logLock)  // kilka wątków może pisać jednocześnie
+                {
+                    File.AppendAllText(plik, linia + Environment.NewLine);
+                }
+            }
+            catch { }
         }
 
         private void WyslijPlik(BinaryWriter writer, string sciezka)
