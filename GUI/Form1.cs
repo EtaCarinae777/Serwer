@@ -4,9 +4,11 @@ using System.Drawing;
 using System.IO;
 using System.Linq;
 using System.Net.Sockets;
+using System.Threading;
 using System.Threading.Tasks;
 using System.Windows.Forms;
 using Newtonsoft.Json;
+using Timer = System.Windows.Forms.Timer;
 
 namespace GUI
 {
@@ -19,6 +21,13 @@ namespace GUI
 
         private static readonly object _plikLock = new object();
         private static readonly object _logLock = new object();
+
+        // ── ZMIANA 1: stała musi odpowiadać MAX_ROWNOLEGLOSCI na serwerze ────
+        // Jeśli zmienisz semafor na serwerze, zmień też tę wartość.
+        private const int SLOTOW_NA_SERWER = 8;
+
+        // ── ZMIANA 2: licznik do równomiernego round-robin ────────────────────
+        private int _licznikZadan = -1;
 
         const int TIMEOUT_MS = 300_000;
 
@@ -69,14 +78,6 @@ namespace GUI
         }
 
         // ── Kolorowanie listy ─────────────────────────────────────────────────
-        // NAPRAWA: wcześniej kod robił "new SolidBrush(...)" bez using/Dispose,
-        // co powodowało wyciek uchwytów GDI. Przy dużej liście par Windows
-        // kończył uchwyty GDI (limit ~10 000) i aplikacja się wysypywała.
-        // Teraz każdy SolidBrush jest tworzony wewnątrz bloku "using".
-        //
-        // NAPRAWA 2: sprawdzamy e.Index < wczytaneWyniki.Count (nie < listPary.Items.Count),
-        // bo Items.Clear() + BeginUpdate może wołać DrawItem ze starymi indeksami
-        // zanim wczytaneWyniki zostanie zaktualizowana — to powodowało IndexOutOfRange.
         private void ListPary_DrawItem(object sender, DrawItemEventArgs e)
         {
             if (e.Index < 0 || e.Index >= wczytaneWyniki.Count) return;
@@ -89,11 +90,8 @@ namespace GUI
                 ? Color.FromArgb(220, 220, 220)
                 : Color.White;
 
-            // NAPRAWA: using zapewnia Dispose() — brak wycieku GDI
             using (SolidBrush tloB = new SolidBrush(tlo))
-            {
                 e.Graphics.FillRectangle(tloB, e.Bounds);
-            }
 
             Color kolorTekstu;
             if (jaccard >= prog)
@@ -111,12 +109,8 @@ namespace GUI
                            jaccard.ToString("F2") + "%" +
                            (jaccard >= prog ? " ⚠" : "");
 
-            // NAPRAWA: using tutaj też
             using (SolidBrush tekstB = new SolidBrush(kolorTekstu))
-            {
-                e.Graphics.DrawString(tekst, e.Font, tekstB,
-                    e.Bounds.X + 2, e.Bounds.Y + 2);
-            }
+                e.Graphics.DrawString(tekst, e.Font, tekstB, e.Bounds.X + 2, e.Bounds.Y + 2);
 
             e.DrawFocusRectangle();
         }
@@ -161,14 +155,14 @@ namespace GUI
             progressBar.Maximum = pary.Count;
             progressBar.Value = 0;
 
-            // NAPRAWA: czyścimy wczytaneWyniki PRZED listPary.Items.Clear(),
-            // żeby DrawItem nigdy nie zobaczył stanu gdzie lista ma 0 itemów
-            // ale wczytaneWyniki ma stare dane (lub odwrotnie).
             wczytaneWyniki.Clear();
             listPary.Items.Clear();
 
             stoper.Restart();
             timerInterfejsu.Start();
+
+            // ── ZMIANA 3: reset licznika przed każdą analizą ─────────────────
+            _licznikZadan = -1;
 
             int wykonane = 0;
             var wynikiBag = new System.Collections.Concurrent.ConcurrentBag<WynikPary>();
@@ -180,16 +174,25 @@ namespace GUI
                 lblStatus.Text = komunikat;
             });
 
+            int liczbaSerwerow = adresy.Count;
+
             await Task.Run(() =>
             {
-                int maxWatkow = Math.Max(1, adresy.Count * 2);
-                maxWatkow = Math.Min(maxWatkow, pary.Count);
+                // ── ZMIANA 4: tyle wątków ile łącznych slotów na wszystkich serwerach ──
+                // Każdy serwer ma SLOTOW_NA_SERWER równoległych zadań — tworzymy
+                // dokładnie tyle wątków GUI żeby nasycić każdy serwer w pełni.
+                // Przy 1 serwerze: 1×8 = 8 wątków (bez zmiany względem serwera).
+                // Przy 3 serwerach: 3×8 = 24 wątki → każdy serwer dostaje ~8 zadań.
+                int maxWatkow = Math.Min(liczbaSerwerow * SLOTOW_NA_SERWER, pary.Count);
 
                 var opcje = new ParallelOptions { MaxDegreeOfParallelism = maxWatkow };
 
-                Parallel.ForEach(pary, opcje, (para, state, indeks) =>
+                Parallel.ForEach(pary, opcje, (para) =>
                 {
-                    int idx = (int)(indeks % adresy.Count);
+                    // ── ZMIANA 5: atomowy round-robin zamiast indeks % adresy.Count ──
+                    // Interlocked.Increment gwarantuje że każdy wątek dostaje
+                    // unikalny, sekwencyjny numer → równomierne rozłożenie zadań.
+                    int idx = (int)((uint)Interlocked.Increment(ref _licznikZadan) % liczbaSerwerow);
 
                     var wynik = WyslijZadanieFailover(
                         adresy, idx, port, para.Item1, para.Item2, n, grainSize);
@@ -211,7 +214,8 @@ namespace GUI
 
             if (oczekiwane != otrzymane)
                 MessageBox.Show(
-                    $"Oczekiwano par: {oczekiwane}\nOtrzymano wyników: {otrzymane}\nNieudane: {oczekiwane - otrzymane}\n\nSprawdź errors.log w folderze Raporty.",
+                    $"Oczekiwano par: {oczekiwane}\nOtrzymano wyników: {otrzymane}\n" +
+                    $"Nieudane: {oczekiwane - otrzymane}\n\nSprawdź errors.log w folderze Raporty.",
                     "Uwaga — brakujące wyniki",
                     MessageBoxButtons.OK, MessageBoxIcon.Warning);
 
@@ -401,10 +405,6 @@ namespace GUI
         }
 
         // ── Podświetlanie fragmentów ─────────────────────────────────────────
-        // NAPRAWA: poprzednio każde rtb.Select() triggerowało redraw i eventy UI.
-        // Przy dużych plikach (setki zakresów) powodowało to crash lub zamrożenie.
-        // Teraz: chowamy kontrolkę na czas operacji (zatrzymuje wszystkie redraws),
-        // po zakończeniu pokazujemy ją z powrotem — jedno odświeżenie zamiast setek.
         private void PodswietlFragmenty(RichTextBox rtb, List<Zakres> zakresy)
         {
             rtb.Visible = false;
