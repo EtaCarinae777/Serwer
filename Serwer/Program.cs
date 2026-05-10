@@ -24,10 +24,19 @@ class Server
     const int MAX_ROWNOLEGLOSCI = 8;
     static readonly SemaphoreSlim semafor = new SemaphoreSlim(MAX_ROWNOLEGLOSCI, MAX_ROWNOLEGLOSCI);
 
+    static readonly object consoleLock = new object();
+
+    static void Log(string komunikat)
+    {
+        lock (consoleLock)
+            Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] {komunikat}");
+    }
+
     static void Main()
     {
         TcpListener serwer = new TcpListener(IPAddress.Any, port);
         serwer.Start();
+        Log($"Serwer uruchomiony na porcie {port}.");
 
         while (true)
         {
@@ -74,6 +83,8 @@ class Server
                 var (nazwa1, tekst1) = OdbierzPlik(reader);
                 var (nazwa2, tekst2) = OdbierzPlik(reader);
 
+                Log($"Przerabiam: {nazwa1}  vs  {nazwa2}");
+
                 var stoper = System.Diagnostics.Stopwatch.StartNew();
 
                 var task1 = Task.Run(() => PobierzNgramy(nazwa1, tekst1, n));
@@ -113,7 +124,10 @@ class Server
                 writer.Flush();
             }
         }
-        catch { }
+        catch (Exception ex)
+        {
+            Log($"BŁĄD: {ex.GetType().Name} — {ex.Message}");
+        }
         finally
         {
             semafor.Release();
