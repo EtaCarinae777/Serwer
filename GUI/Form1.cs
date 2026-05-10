@@ -1,12 +1,13 @@
-﻿using System;
+﻿using Newtonsoft.Json;
+using System;
 using System.Collections.Generic;
 using System.Drawing;
 using System.IO;
 using System.Linq;
 using System.Net.Sockets;
+using System.Text;
 using System.Threading.Tasks;
 using System.Windows.Forms;
-using Newtonsoft.Json;
 
 namespace GUI
 {
@@ -185,20 +186,21 @@ namespace GUI
                 int maxWatkow = Math.Max(1, adresy.Count * 2);
                 maxWatkow = Math.Min(maxWatkow, pary.Count);
 
-                var opcje = new ParallelOptions { MaxDegreeOfParallelism = maxWatkow };
+                var opcje = new ParallelOptions { MaxDegreeOfParallelism = 8 };
 
                 Parallel.ForEach(pary, opcje, (para, state, indeks) =>
                 {
                     int idx = (int)(indeks % adresy.Count);
-
-                    var wynik = WyslijZadanieFailover(
-                        adresy, idx, port, para.Item1, para.Item2, n, grainSize);
+                    var wynik = WyslijZadanieFailover(adresy, idx, port, para.Item1, para.Item2, n, grainSize);
 
                     if (wynik != null)
                         wynikiBag.Add(wynik);
 
-                    ((IProgress<string>)progress).Report(
-                        $"{Path.GetFileName(para.Item1)} vs {Path.GetFileName(para.Item2)}");
+                    // Odświeżaj status w UI tylko co 5 par, żeby nie "zamrozić" okna aplikacji
+                    if (indeks % 5 == 0 || indeks == pary.Count - 1)
+                    {
+                        ((IProgress<string>)progress).Report($"{indeks + 1}/{pary.Count} par...");
+                    }
                 });
             });
 
@@ -495,34 +497,38 @@ namespace GUI
         }
 
         // ── Zapis CSV / JSON ─────────────────────────────────────────────────
-        private void ZapiszCSVLokalnie(string plikA, string plikB, string csv)
+        private async Task ZapiszCSVLokalnie(string plikA, string plikB, string csv)
         {
             try
             {
                 Directory.CreateDirectory("Raporty");
                 string suffix = Guid.NewGuid().ToString("N").Substring(0, 4);
-                string path = Path.Combine("Raporty",
-                    $"{Path.GetFileNameWithoutExtension(plikA)}_VS_" +
-                    $"{Path.GetFileNameWithoutExtension(plikB)}_" +
-                    $"{DateTime.Now:yyyyMMdd_HHmmss}_{suffix}.csv");
-                lock (_plikLock)
-                    File.WriteAllText(path, csv);
+                string path = Path.Combine("Raporty", $"{Path.GetFileNameWithoutExtension(plikA)}_VS_{Path.GetFileNameWithoutExtension(plikB)}_{DateTime.Now:yyyyMMdd_HHmmss}_{suffix}.csv");
+
+                byte[] encodedText = Encoding.UTF8.GetBytes(csv);
+                using (FileStream sourceStream = new FileStream(path, FileMode.Create, FileAccess.Write, FileShare.None, bufferSize: 4096, useAsync: true))
+                {
+                    await sourceStream.WriteAsync(encodedText, 0, encodedText.Length);
+                }
+                ;
             }
             catch { }
         }
 
-        private void ZapiszJSONLokalnie(string plikA, string plikB, string json)
+        private async Task ZapiszJSONLokalnie(string plikA, string plikB, string json)
         {
             try
             {
                 Directory.CreateDirectory("Raporty");
                 string suffix = Guid.NewGuid().ToString("N").Substring(0, 4);
-                string path = Path.Combine("Raporty",
-                    $"{Path.GetFileNameWithoutExtension(plikA)}_VS_" +
-                    $"{Path.GetFileNameWithoutExtension(plikB)}_" +
-                    $"{DateTime.Now:yyyyMMdd_HHmmss}_{suffix}.json");
-                lock (_plikLock)
-                    File.WriteAllText(path, json);
+                string path = Path.Combine("Raporty", $"{Path.GetFileNameWithoutExtension(plikA)}_VS_{Path.GetFileNameWithoutExtension(plikB)}_{DateTime.Now:yyyyMMdd_HHmmss}_{suffix}.json");
+
+                byte[] encodedText = Encoding.UTF8.GetBytes(json);
+                using (FileStream sourceStream = new FileStream(path, FileMode.Create, FileAccess.Write, FileShare.None, bufferSize: 4096, useAsync: true))
+                {
+                    await sourceStream.WriteAsync(encodedText, 0, encodedText.Length);
+                }
+                ;
             }
             catch { }
         }
