@@ -15,6 +15,14 @@ class Server
 {
     static int port = 8001;
 
+    // cache przechowuje juz obliczone ngramy dla kazdego pliku
+    // klucz = nazwa pliku + rozmiar tekstu + n
+    static Dictionary<string, (HashSet<string> ngramy, Dictionary<string, (int od, int do_)> pozycje)> cache
+        = new Dictionary<string, (HashSet<string>, Dictionary<string, (int, int)>)>();
+
+    // lock do synchronizacji dostepu do cache z wielu watkow
+    static readonly object cacheLock = new object();
+
     static void Main()
     {
         TcpListener serwer = new TcpListener(IPAddress.Any, port);
@@ -23,7 +31,6 @@ class Server
         while (true)
         {
             TcpClient klient = serwer.AcceptTcpClient();
-            Console.WriteLine("Nowe polaczenie od klienta");
             Task.Run(() => ObsluzKlienta(klient));
         }
     }
@@ -34,7 +41,6 @@ class Server
         long rozmiar = reader.ReadInt64();
         byte[] dane = reader.ReadBytes((int)rozmiar);
 
-        Console.WriteLine($"[SERWER] Odebrano plik: {nazwa} ({rozmiar} bajtow)");
         return (nazwa, System.Text.Encoding.UTF8.GetString(dane));
     }
 
@@ -46,31 +52,22 @@ class Server
             using (BinaryReader reader = new BinaryReader(stream))
             using (BinaryWriter writer = new BinaryWriter(stream))
             {
-                Console.WriteLine("[SERWER] Klient polaczony!");
-
-                // Odbierz parametry
                 int n = reader.ReadInt32();
                 int grainSize = reader.ReadInt32();
-                Console.WriteLine($"[SERWER] Parametry: n={n}, grainSize={grainSize}");
 
-                // Odbierz plik 1
-                Console.WriteLine("[SERWER] Odbieram plik 1...");
                 var (nazwa1, tekst1) = OdbierzPlik(reader);
-
-                // Odbierz plik 2
-                Console.WriteLine("[SERWER] Odbieram plik 2...");
                 var (nazwa2, tekst2) = OdbierzPlik(reader);
 
-                // mierzymy czas samych obliczen
                 var stoper = System.Diagnostics.Stopwatch.StartNew();
 
-                // tokenizacja z pozycjami
-                var tokeny1 = PodzielNaSlowa(tekst1);
-                var tokeny2 = PodzielNaSlowa(tekst2);
+                // pobieramy ngramy z cache lub liczymy jesli pierwsza wizyta
+                // oba pliki tokenizowane rownoleglie
+                var task1 = Task.Run(() => PobierzNgramy(nazwa1, tekst1, n));
+                var task2 = Task.Run(() => PobierzNgramy(nazwa2, tekst2, n));
+                Task.WaitAll(task1, task2);
 
-                // generowanie n-gramow z pozycjami
-                var (ngramy1, pozycje1) = GenerujNgramy(tokeny1, n);
-                var (ngramy2, pozycje2) = GenerujNgramy(tokeny2, n);
+                var (ngramy1, pozycje1) = task1.Result;
+                var (ngramy2, pozycje2) = task2.Result;
 
                 //intersection - czesc wspolna n-gramow
                 var intersection = new HashSet<string>(ngramy1);
@@ -78,20 +75,16 @@ class Server
 
                 //jaccard - podobienstwo w procentach
                 double Jaccard = ObliczJaccard(ngramy1, ngramy2);
-                Console.WriteLine($"Współczynnik Jaccarda: {Jaccard}%");
 
                 //dwustronne podobienstwo
                 var (aDoB, bDoA) = ObliczDwustronne(ngramy1, ngramy2);
 
-                // zakresy podobnych fragmentow zamiast zdan
+                // zakresy podobnych fragmentow
                 var zakresy1 = ZnajdzPodobneZakresy(pozycje1, intersection);
                 var zakresy2 = ZnajdzPodobneZakresy(pozycje2, intersection);
 
                 stoper.Stop();
                 long czasObliczenMs = stoper.ElapsedMilliseconds;
-                Console.WriteLine($"[SERWER] Czas obliczen: {czasObliczenMs} ms");
-                Console.WriteLine($"[SERWER] Znaleziono {zakresy1.Count} zakresow w pliku 1");
-                Console.WriteLine($"[SERWER] Znaleziono {zakresy2.Count} zakresow w pliku 2");
 
                 string csvContent = GenerujCSV(nazwa1, nazwa2, Jaccard, aDoB, bDoA, zakresy1, zakresy2);
 
@@ -116,7 +109,6 @@ class Server
                     writer.Write(do_);
                 }
 
-                // generujemy JSON z trescia plikow i zakresami
                 string jsonContent = GenerujJSON(
                     nazwa1, nazwa2,
                     tekst1, tekst2,
@@ -126,14 +118,39 @@ class Server
                 writer.Write(csvContent);
                 writer.Write(jsonContent);
                 writer.Write(czasObliczenMs);
-
-                Console.WriteLine("[SERWER] Zakonczono!");
             }
         }
         catch (Exception e)
         {
             Console.WriteLine($"[SERWER] Blad: {e.Message}");
         }
+    }
+
+    // pobiera ngramy z cache lub oblicza je jesli jeszcze nie ma
+    static (HashSet<string> ngramy, Dictionary<string, (int od, int do_)> pozycje)
+        PobierzNgramy(string nazwaPliku, string tekst, int n)
+    {
+        // klucz = nazwa pliku + rozmiar tekstu + n
+        // jesli plik sie zmienil (inny rozmiar) liczymy od nowa
+        string klucz = nazwaPliku + "_" + tekst.Length + "_n" + n;
+
+        lock (cacheLock)
+        {
+            if (cache.ContainsKey(klucz))
+                return cache[klucz];
+        }
+
+        // nie ma w cache - liczymy
+        var tokeny = PodzielNaSlowa(tekst);
+        var wynik = GenerujNgramy(tokeny, n);
+
+        lock (cacheLock)
+        {
+            if (!cache.ContainsKey(klucz))
+                cache[klucz] = wynik;
+        }
+
+        return wynik;
     }
 
     // na razie liczy slowa, pozniej zastapiona przez PorownajPliki()
@@ -298,17 +315,16 @@ class Server
     }
 
     static string GenerujJSON(
-    string nazwaA,
-    string nazwaB,
-    string tekstA,
-    string tekstB,
-    double jaccard,
-    double aDoB,
-    double bDoA,
-    List<(int od, int do_)> zakresy1,
-    List<(int od, int do_)> zakresy2)
+        string nazwaA,
+        string nazwaB,
+        string tekstA,
+        string tekstB,
+        double jaccard,
+        double aDoB,
+        double bDoA,
+        List<(int od, int do_)> zakresy1,
+        List<(int od, int do_)> zakresy2)
     {
-        // budujemy obiekt jako slownik
         var dane = new
         {
             plikA = nazwaA,

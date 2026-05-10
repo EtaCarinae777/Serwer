@@ -24,15 +24,11 @@ namespace GUI
             listPary.DrawMode = DrawMode.OwnerDrawFixed;
             listPary.DrawItem += ListPary_DrawItem;
             timerInterfejsu = new Timer();
-            timerInterfejsu.Interval = 1000; // aktualizacja co sekundę
+            timerInterfejsu.Interval = 1000;
             timerInterfejsu.Tick += (s, e) => {
                 lblTimer.Text = $"Czas: {stoper.Elapsed:hh\\:mm\\:ss}";
             };
         }
-
-        // ===================================================================
-        // Modele danych
-        // ===================================================================
 
         private class WynikPary
         {
@@ -52,10 +48,6 @@ namespace GUI
             public int od { get; set; }
             public int do_ { get; set; }
         }
-
-        // ===================================================================
-        // NOWE: Wybieranie plików
-        // ===================================================================
 
         private void btnWybierzPliki_Click(object sender, EventArgs e)
         {
@@ -78,27 +70,23 @@ namespace GUI
             double jaccard = wynik.jaccard;
             double prog = (double)numProg.Value;
 
-            // Tło — białe zawsze, ciemniejsze gdy zaznaczony
             Color tlo = (e.State & DrawItemState.Selected) == DrawItemState.Selected
                 ? Color.FromArgb(220, 220, 220)
                 : Color.White;
 
             e.Graphics.FillRectangle(new SolidBrush(tlo), e.Bounds);
 
-            // Kolor tekstu — gradient czerwony wg % dla plagiatów, zielony dla czystych
             Color kolorTekstu;
             if (jaccard >= prog)
             {
-                // 30% → jasny pomarańczowoczerwony, 100% → intensywna czerwień
                 double t = Math.Min((jaccard - prog) / (100.0 - prog), 1.0);
                 int r = 255;
-                int g = (int)(140 * (1.0 - t)); // 140 → 0
+                int g = (int)(140 * (1.0 - t));
                 int b = 0;
                 kolorTekstu = Color.FromArgb(r, g, b);
             }
             else
             {
-                // czyste — ciemna zieleń
                 kolorTekstu = Color.FromArgb(0, 140, 0);
             }
 
@@ -112,13 +100,6 @@ namespace GUI
 
             e.DrawFocusRectangle();
         }
-
-
-
-
-        // ===================================================================
-        // NOWE: Analiza — logika przeniesiona z Klient/Program.cs
-        // ===================================================================
 
         private async void btnAnalyzuj_Click(object sender, EventArgs e)
         {
@@ -141,7 +122,6 @@ namespace GUI
                 return;
             }
 
-            // Pobranie parametrów z UI
             int n = (int)numN.Value;
             int grainSize = (int)numGrainSize.Value;
             double prog = (double)numProg.Value;
@@ -154,7 +134,6 @@ namespace GUI
 
             var pary = GenerujPary(posortowane);
 
-            // Przygotowanie UI
             btnAnalyzuj.Enabled = false;
             btnWybierzPliki.Enabled = false;
             progressBar.Minimum = 0;
@@ -163,9 +142,6 @@ namespace GUI
             wczytaneWyniki.Clear();
             listPary.Items.Clear();
 
-            // ==========================================
-            // START LICZNIKA
-            // ==========================================
             stoper.Restart();
             if (timerInterfejsu == null)
             {
@@ -173,12 +149,8 @@ namespace GUI
                 timerInterfejsu.Tick += (s, ev) => lblTimer.Text = $"Czas pracy: {stoper.Elapsed:hh\\:mm\\:ss}";
             }
             timerInterfejsu.Start();
-            // ==========================================
 
             int wykonane = 0;
-            var kolejka = new System.Collections.Concurrent.ConcurrentQueue<(string, string)>();
-            foreach (var para in pary) kolejka.Enqueue(para);
-
             var wynikiBag = new System.Collections.Concurrent.ConcurrentBag<WynikPary>();
 
             var progress = new Progress<string>(komunikat =>
@@ -190,40 +162,36 @@ namespace GUI
 
             await Task.Run(() =>
             {
-                var taski = new List<Task>();
+                // maksymalnie 4 rownoczesne polaczenia na serwer
+                // przy wiekszej liczbie serwer sie dławi i pary gina
+                int maxWatkow = Math.Min(pary.Count, adresy.Count * 4);
 
-                for (int i = 0; i < adresy.Count; i++)
+                var opcje = new ParallelOptions { MaxDegreeOfParallelism = maxWatkow };
+
+                Parallel.ForEach(pary, opcje, (para, state, indeks) =>
                 {
-                    int idx = i;
-                    taski.Add(Task.Run(() =>
-                    {
-                        while (kolejka.TryDequeue(out var para))
-                        {
-                            // Wysyłanie zadania do serwerów z mechanizmem failover
-                            var wynik = WyslijZadanieFailover(
-                                adresy, idx, port, para.Item1, para.Item2, n, grainSize);
+                    int idx = (int)(indeks % adresy.Count);
 
-                            if (wynik != null)
-                                wynikiBag.Add(wynik);
+                    var wynik = WyslijZadanieFailover(
+                        adresy, idx, port, para.Item1, para.Item2, n, grainSize);
 
-                            ((IProgress<string>)progress).Report(
-                                $"{Path.GetFileName(para.Item1)} vs {Path.GetFileName(para.Item2)}");
-                        }
-                    }));
-                }
+                    if (wynik != null)
+                        wynikiBag.Add(wynik);
 
-                Task.WaitAll(taski.ToArray());
+                    ((IProgress<string>)progress).Report(
+                        $"{Path.GetFileName(para.Item1)} vs {Path.GetFileName(para.Item2)}");
+                });
             });
 
-            // ==========================================
-            // STOP LICZNIKA
-            // ==========================================
             stoper.Stop();
             timerInterfejsu.Stop();
             lblTimer.Text = $"Czas całkowity: {stoper.Elapsed:hh\\:mm\\:ss}";
-            // ==========================================
 
-            // Porządkowanie wyników i aktualizacja listy
+            // sprawdzamy ile par sie udalo
+            int oczekiwane = pary.Count;
+            int otrzymane = wynikiBag.Count;
+            MessageBox.Show($"Oczekiwano par: {oczekiwane}\nOtrzymano wynikow: {otrzymane}\nRoznica: {oczekiwane - otrzymane}");
+
             wczytaneWyniki = wynikiBag
                 .OrderByDescending(w => w.jaccard)
                 .ToList();
@@ -239,10 +207,6 @@ namespace GUI
                 lblStatus.Text += $" ⚠ Wykryto {plagiatow} plagiatów!";
         }
 
-        // ===================================================================
-        // Logika sieciowa (przeniesiona z Klient/Program.cs)
-        // ===================================================================
-
         private WynikPary WyslijZadanieFailover(
             List<string> adresy, int startIdx, int port,
             string plikA, string plikB, int n, int grainSize)
@@ -257,16 +221,15 @@ namespace GUI
         }
 
         private WynikPary WyslijZadanie(
-     string adres, int port,
-     string plikA, string plikB,
-     int n, int grainSize)
+            string adres, int port,
+            string plikA, string plikB,
+            int n, int grainSize)
         {
             try
             {
                 using (TcpClient klient = new TcpClient())
                 {
-                    // timeout na samo Connect — bez tego może wisieć w nieskończoność
-                    bool connected = klient.ConnectAsync(adres, port).Wait(3000);
+                    bool connected = klient.ConnectAsync(adres, port).Wait(10000);
                     if (!connected)
                     {
                         ZapiszLog($"[TIMEOUT] Serwer {adres}:{port} nie odpowiedział w ciągu 3s.");
@@ -342,7 +305,6 @@ namespace GUI
             }
         }
 
-        // Dopisz tę metodę obok pozostałych pomocniczych:
         private static readonly object _logLock = new object();
 
         private void ZapiszLog(string komunikat)
@@ -352,8 +314,7 @@ namespace GUI
                 Directory.CreateDirectory("Raporty");
                 string plik = Path.Combine("Raporty", "errors.log");
                 string linia = $"{DateTime.Now:yyyy-MM-dd HH:mm:ss} {komunikat}";
-
-                lock (_logLock)  // kilka wątków może pisać jednocześnie
+                lock (_logLock)
                 {
                     File.AppendAllText(plik, linia + Environment.NewLine);
                 }
@@ -369,10 +330,6 @@ namespace GUI
             writer.Write(dane);
         }
 
-        // ===================================================================
-        // Pomocnicze — generowanie par
-        // ===================================================================
-
         private List<(string, string)> GenerujPary(List<string> pliki)
         {
             var pary = new List<(string, string)>();
@@ -381,10 +338,6 @@ namespace GUI
                     pary.Add((pliki[i], pliki[j]));
             return pary;
         }
-
-        // ===================================================================
-        // Zapis raportów na dysk (identycznie jak w Kliencie)
-        // ===================================================================
 
         private void ZapiszCSVLokalnie(string plikA, string plikB, string csv)
         {
@@ -397,7 +350,7 @@ namespace GUI
                     $"{DateTime.Now:yyyyMMdd_HHmmss}.csv");
                 File.WriteAllText(path, csv);
             }
-            catch { /* nie przerywaj analizy jeśli zapis się nie uda */ }
+            catch { }
         }
 
         private void ZapiszJSONLokalnie(string plikA, string plikB, string json)
@@ -413,10 +366,6 @@ namespace GUI
             }
             catch { }
         }
-
-        // ===================================================================
-        // Wczytywanie wyników z folderu (istniejąca funkcja)
-        // ===================================================================
 
         private void btnWczytaj_Click(object sender, EventArgs e)
         {
@@ -458,15 +407,11 @@ namespace GUI
             MessageBox.Show("Wczytano " + wczytaneWyniki.Count + " wyników!");
         }
 
-        // ===================================================================
-        // UI — lista i podświetlanie
-        // ===================================================================
-
         private void OdswiezListe()
         {
             listPary.Items.Clear();
             foreach (var wynik in wczytaneWyniki)
-                listPary.Items.Add(wynik.plikA); // tekst nieważny, DrawItem go nadpisuje
+                listPary.Items.Add(wynik.plikA);
         }
 
         private void ListPary_SelectedIndexChanged(object sender, EventArgs e)

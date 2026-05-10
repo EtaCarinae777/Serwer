@@ -1,0 +1,8 @@
+# Adresy serwerow
+127.0.0.1
+
+# Parametry
+n=4
+grainSize=1
+prog=30
+port=8001
