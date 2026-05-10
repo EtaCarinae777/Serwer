@@ -17,12 +17,18 @@ namespace GUI
         private List<WynikPary> wczytaneWyniki = new List<WynikPary>();
         private List<string> _wybranePliki = new List<string>();
 
+        private static readonly object _plikLock = new object();
+        private static readonly object _logLock = new object();
+
+        const int TIMEOUT_MS = 300_000;
+
         public Form1()
         {
             InitializeComponent();
             listPary.SelectedIndexChanged += ListPary_SelectedIndexChanged;
             listPary.DrawMode = DrawMode.OwnerDrawFixed;
             listPary.DrawItem += ListPary_DrawItem;
+
             timerInterfejsu = new Timer();
             timerInterfejsu.Interval = 1000;
             timerInterfejsu.Tick += (s, e) => {
@@ -30,6 +36,7 @@ namespace GUI
             };
         }
 
+        // ── Model danych ─────────────────────────────────────────────────────
         private class WynikPary
         {
             public string plikA { get; set; }
@@ -37,8 +44,6 @@ namespace GUI
             public double jaccard { get; set; }
             public double aDoB { get; set; }
             public double bDoA { get; set; }
-            public string tekstA { get; set; }
-            public string tekstB { get; set; }
             public List<Zakres> zakresy1 { get; set; }
             public List<Zakres> zakresy2 { get; set; }
         }
@@ -49,6 +54,7 @@ namespace GUI
             public int do_ { get; set; }
         }
 
+        // ── Wybór plików ─────────────────────────────────────────────────────
         private void btnWybierzPliki_Click(object sender, EventArgs e)
         {
             OpenFileDialog dialog = new OpenFileDialog();
@@ -62,6 +68,15 @@ namespace GUI
             lblWybranePliki.Text = $"Wybrano {_wybranePliki.Count} plików";
         }
 
+        // ── Kolorowanie listy ─────────────────────────────────────────────────
+        // NAPRAWA: wcześniej kod robił "new SolidBrush(...)" bez using/Dispose,
+        // co powodowało wyciek uchwytów GDI. Przy dużej liście par Windows
+        // kończył uchwyty GDI (limit ~10 000) i aplikacja się wysypywała.
+        // Teraz każdy SolidBrush jest tworzony wewnątrz bloku "using".
+        //
+        // NAPRAWA 2: sprawdzamy e.Index < wczytaneWyniki.Count (nie < listPary.Items.Count),
+        // bo Items.Clear() + BeginUpdate może wołać DrawItem ze starymi indeksami
+        // zanim wczytaneWyniki zostanie zaktualizowana — to powodowało IndexOutOfRange.
         private void ListPary_DrawItem(object sender, DrawItemEventArgs e)
         {
             if (e.Index < 0 || e.Index >= wczytaneWyniki.Count) return;
@@ -74,16 +89,17 @@ namespace GUI
                 ? Color.FromArgb(220, 220, 220)
                 : Color.White;
 
-            e.Graphics.FillRectangle(new SolidBrush(tlo), e.Bounds);
+            // NAPRAWA: using zapewnia Dispose() — brak wycieku GDI
+            using (SolidBrush tloB = new SolidBrush(tlo))
+            {
+                e.Graphics.FillRectangle(tloB, e.Bounds);
+            }
 
             Color kolorTekstu;
             if (jaccard >= prog)
             {
                 double t = Math.Min((jaccard - prog) / (100.0 - prog), 1.0);
-                int r = 255;
-                int g = (int)(140 * (1.0 - t));
-                int b = 0;
-                kolorTekstu = Color.FromArgb(r, g, b);
+                kolorTekstu = Color.FromArgb(255, (int)(140 * (1.0 - t)), 0);
             }
             else
             {
@@ -95,12 +111,17 @@ namespace GUI
                            jaccard.ToString("F2") + "%" +
                            (jaccard >= prog ? " ⚠" : "");
 
-            e.Graphics.DrawString(tekst, e.Font, new SolidBrush(kolorTekstu),
-                e.Bounds.X + 2, e.Bounds.Y + 2);
+            // NAPRAWA: using tutaj też
+            using (SolidBrush tekstB = new SolidBrush(kolorTekstu))
+            {
+                e.Graphics.DrawString(tekst, e.Font, tekstB,
+                    e.Bounds.X + 2, e.Bounds.Y + 2);
+            }
 
             e.DrawFocusRectangle();
         }
 
+        // ── Główna analiza ───────────────────────────────────────────────────
         private async void btnAnalyzuj_Click(object sender, EventArgs e)
         {
             if (_wybranePliki.Count < 2)
@@ -139,15 +160,14 @@ namespace GUI
             progressBar.Minimum = 0;
             progressBar.Maximum = pary.Count;
             progressBar.Value = 0;
+
+            // NAPRAWA: czyścimy wczytaneWyniki PRZED listPary.Items.Clear(),
+            // żeby DrawItem nigdy nie zobaczył stanu gdzie lista ma 0 itemów
+            // ale wczytaneWyniki ma stare dane (lub odwrotnie).
             wczytaneWyniki.Clear();
             listPary.Items.Clear();
 
             stoper.Restart();
-            if (timerInterfejsu == null)
-            {
-                timerInterfejsu = new Timer { Interval = 1000 };
-                timerInterfejsu.Tick += (s, ev) => lblTimer.Text = $"Czas pracy: {stoper.Elapsed:hh\\:mm\\:ss}";
-            }
             timerInterfejsu.Start();
 
             int wykonane = 0;
@@ -162,9 +182,8 @@ namespace GUI
 
             await Task.Run(() =>
             {
-                // maksymalnie 4 rownoczesne polaczenia na serwer
-                // przy wiekszej liczbie serwer sie dławi i pary gina
-                int maxWatkow = Math.Min(pary.Count, adresy.Count * 4);
+                int maxWatkow = Math.Max(1, adresy.Count * 2);
+                maxWatkow = Math.Min(maxWatkow, pary.Count);
 
                 var opcje = new ParallelOptions { MaxDegreeOfParallelism = maxWatkow };
 
@@ -187,10 +206,14 @@ namespace GUI
             timerInterfejsu.Stop();
             lblTimer.Text = $"Czas całkowity: {stoper.Elapsed:hh\\:mm\\:ss}";
 
-            // sprawdzamy ile par sie udalo
             int oczekiwane = pary.Count;
             int otrzymane = wynikiBag.Count;
-            MessageBox.Show($"Oczekiwano par: {oczekiwane}\nOtrzymano wynikow: {otrzymane}\nRoznica: {oczekiwane - otrzymane}");
+
+            if (oczekiwane != otrzymane)
+                MessageBox.Show(
+                    $"Oczekiwano par: {oczekiwane}\nOtrzymano wyników: {otrzymane}\nNieudane: {oczekiwane - otrzymane}\n\nSprawdź errors.log w folderze Raporty.",
+                    "Uwaga — brakujące wyniki",
+                    MessageBoxButtons.OK, MessageBoxIcon.Warning);
 
             wczytaneWyniki = wynikiBag
                 .OrderByDescending(w => w.jaccard)
@@ -198,28 +221,38 @@ namespace GUI
 
             OdswiezListe();
 
-            lblStatus.Text = $"Gotowe! Przeanalizowano {wczytaneWyniki.Count} par.";
+            int plagiatow = wczytaneWyniki.Count(w => w.jaccard >= prog);
+            lblStatus.Text = $"Gotowe! Przeanalizowano {wczytaneWyniki.Count} par." +
+                             (plagiatow > 0 ? $" ⚠ Wykryto {plagiatow} plagiatów!" : "");
+
             btnAnalyzuj.Enabled = true;
             btnWybierzPliki.Enabled = true;
-
-            int plagiatow = wczytaneWyniki.Count(w => w.jaccard >= prog);
-            if (plagiatow > 0)
-                lblStatus.Text += $" ⚠ Wykryto {plagiatow} plagiatów!";
         }
 
+        // ── Failover ─────────────────────────────────────────────────────────
         private WynikPary WyslijZadanieFailover(
             List<string> adresy, int startIdx, int port,
             string plikA, string plikB, int n, int grainSize)
         {
             for (int i = 0; i < adresy.Count; i++)
             {
-                int idx = (startIdx + i) % adresy.Count;
-                var wynik = WyslijZadanie(adresy[idx], port, plikA, plikB, n, grainSize);
-                if (wynik != null) return wynik;
+                int aktIdx = (startIdx + i) % adresy.Count;
+                string adres = adresy[aktIdx];
+
+                var wynik = WyslijZadanie(adres, port, plikA, plikB, n, grainSize);
+                if (wynik != null)
+                    return wynik;
+
+                ZapiszLog($"[FAILOVER] Serwer {adres}:{port} zawiódł dla pary " +
+                          $"{Path.GetFileName(plikA)} vs {Path.GetFileName(plikB)}. Próbuję następny...");
             }
+
+            ZapiszLog($"[BLAD] Wszystkie serwery zawiodły dla pary " +
+                      $"{Path.GetFileName(plikA)} vs {Path.GetFileName(plikB)}.");
             return null;
         }
 
+        // ── Wysłanie zadania ─────────────────────────────────────────────────
         private WynikPary WyslijZadanie(
             string adres, int port,
             string plikA, string plikB,
@@ -229,15 +262,9 @@ namespace GUI
             {
                 using (TcpClient klient = new TcpClient())
                 {
-                    bool connected = klient.ConnectAsync(adres, port).Wait(10000);
-                    if (!connected)
-                    {
-                        ZapiszLog($"[TIMEOUT] Serwer {adres}:{port} nie odpowiedział w ciągu 3s.");
-                        return null;
-                    }
-
-                    klient.ReceiveTimeout = 30000;
-                    klient.SendTimeout = 30000;
+                    klient.ReceiveTimeout = TIMEOUT_MS;
+                    klient.SendTimeout = TIMEOUT_MS;
+                    klient.Connect(adres, port);
 
                     using (NetworkStream stream = klient.GetStream())
                     using (BinaryWriter writer = new BinaryWriter(stream))
@@ -270,9 +297,6 @@ namespace GUI
                         ZapiszCSVLokalnie(plikA, plikB, csv);
                         ZapiszJSONLokalnie(plikA, plikB, json);
 
-                        WynikPary wynikZJson = null;
-                        try { wynikZJson = JsonConvert.DeserializeObject<WynikPary>(json); } catch { }
-
                         return new WynikPary
                         {
                             plikA = plikA,
@@ -280,8 +304,6 @@ namespace GUI
                             jaccard = jaccard,
                             aDoB = aDoB,
                             bDoA = bDoA,
-                            tekstA = wynikZJson?.tekstA ?? File.ReadAllText(plikA),
-                            tekstB = wynikZJson?.tekstB ?? File.ReadAllText(plikB),
                             zakresy1 = zakresy1,
                             zakresy2 = zakresy2
                         };
@@ -295,7 +317,7 @@ namespace GUI
             }
             catch (IOException ex)
             {
-                ZapiszLog($"[IO ERROR] Serwer {adres}:{port} zerwał połączenie — {ex.Message}");
+                ZapiszLog($"[IO ERROR] Serwer {adres}:{port} zerwał połączenie lub timeout — {ex.Message}");
                 return null;
             }
             catch (Exception ex)
@@ -305,31 +327,24 @@ namespace GUI
             }
         }
 
-        private static readonly object _logLock = new object();
-
-        private void ZapiszLog(string komunikat)
-        {
-            try
-            {
-                Directory.CreateDirectory("Raporty");
-                string plik = Path.Combine("Raporty", "errors.log");
-                string linia = $"{DateTime.Now:yyyy-MM-dd HH:mm:ss} {komunikat}";
-                lock (_logLock)
-                {
-                    File.AppendAllText(plik, linia + Environment.NewLine);
-                }
-            }
-            catch { }
-        }
-
         private void WyslijPlik(BinaryWriter writer, string sciezka)
         {
-            byte[] dane = File.ReadAllBytes(sciezka);
-            writer.Write(Path.GetFileName(sciezka));
-            writer.Write((long)dane.Length);
-            writer.Write(dane);
+            string nazwa = Path.GetFileName(sciezka);
+            long rozmiar = new FileInfo(sciezka).Length;
+
+            writer.Write(nazwa);
+            writer.Write(rozmiar);
+
+            using (FileStream fs = new FileStream(sciezka, FileMode.Open, FileAccess.Read, FileShare.Read))
+            {
+                byte[] bufor = new byte[65536];
+                int przeczytane;
+                while ((przeczytane = fs.Read(bufor, 0, bufor.Length)) > 0)
+                    writer.Write(bufor, 0, przeczytane);
+            }
         }
 
+        // ── Generowanie par ──────────────────────────────────────────────────
         private List<(string, string)> GenerujPary(List<string> pliki)
         {
             var pary = new List<(string, string)>();
@@ -339,34 +354,91 @@ namespace GUI
             return pary;
         }
 
-        private void ZapiszCSVLokalnie(string plikA, string plikB, string csv)
+        // ── Lista par ────────────────────────────────────────────────────────
+        private void OdswiezListe()
+        {
+            listPary.BeginUpdate();
+            listPary.Items.Clear();
+            foreach (var wynik in wczytaneWyniki)
+                listPary.Items.Add(
+                    Path.GetFileName(wynik.plikA) + " vs " + Path.GetFileName(wynik.plikB));
+            listPary.EndUpdate();
+        }
+
+        // ── Wybór pary — lazy load tekstów ──────────────────────────────────
+        private void ListPary_SelectedIndexChanged(object sender, EventArgs e)
+        {
+            int indeks = listPary.SelectedIndex;
+            if (indeks < 0 || indeks >= wczytaneWyniki.Count) return;
+
+            WynikPary wynik = wczytaneWyniki[indeks];
+
+            lblNazwaA.Text = Path.GetFileName(wynik.plikA) + $" (A→B: {wynik.aDoB:F2}%)";
+            lblNazwaB.Text = Path.GetFileName(wynik.plikB) + $" (B→A: {wynik.bDoA:F2}%)";
+
+            string tekstA = WczytajTekstLokalnie(wynik.plikA);
+            string tekstB = WczytajTekstLokalnie(wynik.plikB);
+
+            rtbPlikA.Text = tekstA;
+            rtbPlikB.Text = tekstB;
+
+            PodswietlFragmenty(rtbPlikA, wynik.zakresy1);
+            PodswietlFragmenty(rtbPlikB, wynik.zakresy2);
+        }
+
+        private string WczytajTekstLokalnie(string sciezka)
         {
             try
             {
-                Directory.CreateDirectory("Raporty");
-                string path = Path.Combine("Raporty",
-                    $"{Path.GetFileNameWithoutExtension(plikA)}_VS_" +
-                    $"{Path.GetFileNameWithoutExtension(plikB)}_" +
-                    $"{DateTime.Now:yyyyMMdd_HHmmss}.csv");
-                File.WriteAllText(path, csv);
+                if (File.Exists(sciezka))
+                    return File.ReadAllText(sciezka);
+                return $"[Plik niedostępny: {sciezka}]";
             }
-            catch { }
+            catch (Exception ex)
+            {
+                return $"[Błąd odczytu: {ex.Message}]";
+            }
         }
 
-        private void ZapiszJSONLokalnie(string plikA, string plikB, string json)
+        // ── Podświetlanie fragmentów ─────────────────────────────────────────
+        // NAPRAWA: poprzednio każde rtb.Select() triggerowało redraw i eventy UI.
+        // Przy dużych plikach (setki zakresów) powodowało to crash lub zamrożenie.
+        // Teraz: chowamy kontrolkę na czas operacji (zatrzymuje wszystkie redraws),
+        // po zakończeniu pokazujemy ją z powrotem — jedno odświeżenie zamiast setek.
+        private void PodswietlFragmenty(RichTextBox rtb, List<Zakres> zakresy)
         {
+            rtb.Visible = false;
             try
             {
-                Directory.CreateDirectory("Raporty");
-                string path = Path.Combine("Raporty",
-                    $"{Path.GetFileNameWithoutExtension(plikA)}_VS_" +
-                    $"{Path.GetFileNameWithoutExtension(plikB)}_" +
-                    $"{DateTime.Now:yyyyMMdd_HHmmss}.json");
-                File.WriteAllText(path, json);
+                rtb.SelectAll();
+                rtb.SelectionBackColor = Color.White;
+
+                if (zakresy != null)
+                {
+                    foreach (var zakres in zakresy)
+                    {
+                        int od = zakres.od;
+                        int dlugosc = zakres.do_ - zakres.od;
+
+                        if (od < 0 || od >= rtb.TextLength) continue;
+                        if (od + dlugosc > rtb.TextLength)
+                            dlugosc = rtb.TextLength - od;
+                        if (dlugosc <= 0) continue;
+
+                        rtb.Select(od, dlugosc);
+                        rtb.SelectionBackColor = Color.Yellow;
+                    }
+                }
+
+                rtb.Select(0, 0);
             }
-            catch { }
+            finally
+            {
+                rtb.Visible = true;
+            }
         }
 
+        // ── Wczytywanie wyników z folderu ────────────────────────────────────
         private void btnWczytaj_Click(object sender, EventArgs e)
         {
             FolderBrowserDialog dialog = new FolderBrowserDialog();
@@ -384,76 +456,89 @@ namespace GUI
 
             if (plikiJson.Length == 0)
             {
-                MessageBox.Show("Nie znaleziono żadnych plików JSON w tym folderze!");
+                MessageBox.Show("Nie znaleziono żadnych plików JSON w tym folderze!",
+                    "Brak wyników", MessageBoxButtons.OK, MessageBoxIcon.Information);
                 return;
             }
 
+            int bledy = 0;
             foreach (string plikJson in plikiJson)
             {
                 try
                 {
                     string zawartosc = File.ReadAllText(plikJson);
                     WynikPary wynik = JsonConvert.DeserializeObject<WynikPary>(zawartosc);
+
+                    if (wynik == null || wynik.plikA == null || wynik.plikB == null)
+                    {
+                        bledy++;
+                        continue;
+                    }
+
                     wczytaneWyniki.Add(wynik);
                 }
-                catch (Exception ex)
+                catch
                 {
-                    Console.WriteLine("Blad wczytywania: " + ex.Message);
+                    bledy++;
                 }
             }
 
             wczytaneWyniki.Sort((a, b) => b.jaccard.CompareTo(a.jaccard));
             OdswiezListe();
-            MessageBox.Show("Wczytano " + wczytaneWyniki.Count + " wyników!");
+
+            string komunikat = $"Wczytano {wczytaneWyniki.Count} wyników.";
+            if (bledy > 0)
+                komunikat += $"\nPominięto {bledy} uszkodzonych plików.";
+
+            MessageBox.Show(komunikat, "Wczytywanie zakończone",
+                MessageBoxButtons.OK, MessageBoxIcon.Information);
         }
 
-        private void OdswiezListe()
+        // ── Zapis CSV / JSON ─────────────────────────────────────────────────
+        private void ZapiszCSVLokalnie(string plikA, string plikB, string csv)
         {
-            listPary.Items.Clear();
-            foreach (var wynik in wczytaneWyniki)
-                listPary.Items.Add(wynik.plikA);
-        }
-
-        private void ListPary_SelectedIndexChanged(object sender, EventArgs e)
-        {
-            int indeks = listPary.SelectedIndex;
-            if (indeks < 0 || indeks >= wczytaneWyniki.Count) return;
-
-            WynikPary wynik = wczytaneWyniki[indeks];
-
-            lblNazwaA.Text = Path.GetFileName(wynik.plikA) +
-                             " (A→B: " + wynik.aDoB.ToString("F2") + "%)";
-            lblNazwaB.Text = Path.GetFileName(wynik.plikB) +
-                             " (B→A: " + wynik.bDoA.ToString("F2") + "%)";
-
-            rtbPlikA.Text = wynik.tekstA;
-            rtbPlikB.Text = wynik.tekstB;
-
-            PodswietlFragmenty(rtbPlikA, wynik.zakresy1);
-            PodswietlFragmenty(rtbPlikB, wynik.zakresy2);
-        }
-
-        private void PodswietlFragmenty(RichTextBox rtb, List<Zakres> zakresy)
-        {
-            rtb.SelectAll();
-            rtb.SelectionBackColor = Color.White;
-
-            if (zakresy == null) return;
-
-            foreach (var zakres in zakresy)
+            try
             {
-                int od = zakres.od;
-                int dlugosc = zakres.do_ - zakres.od;
-
-                if (od < 0 || od >= rtb.Text.Length) continue;
-                if (od + dlugosc > rtb.Text.Length)
-                    dlugosc = rtb.Text.Length - od;
-
-                rtb.Select(od, dlugosc);
-                rtb.SelectionBackColor = Color.Yellow;
+                Directory.CreateDirectory("Raporty");
+                string suffix = Guid.NewGuid().ToString("N").Substring(0, 4);
+                string path = Path.Combine("Raporty",
+                    $"{Path.GetFileNameWithoutExtension(plikA)}_VS_" +
+                    $"{Path.GetFileNameWithoutExtension(plikB)}_" +
+                    $"{DateTime.Now:yyyyMMdd_HHmmss}_{suffix}.csv");
+                lock (_plikLock)
+                    File.WriteAllText(path, csv);
             }
+            catch { }
+        }
 
-            rtb.Select(0, 0);
+        private void ZapiszJSONLokalnie(string plikA, string plikB, string json)
+        {
+            try
+            {
+                Directory.CreateDirectory("Raporty");
+                string suffix = Guid.NewGuid().ToString("N").Substring(0, 4);
+                string path = Path.Combine("Raporty",
+                    $"{Path.GetFileNameWithoutExtension(plikA)}_VS_" +
+                    $"{Path.GetFileNameWithoutExtension(plikB)}_" +
+                    $"{DateTime.Now:yyyyMMdd_HHmmss}_{suffix}.json");
+                lock (_plikLock)
+                    File.WriteAllText(path, json);
+            }
+            catch { }
+        }
+
+        // ── Logi błędów ──────────────────────────────────────────────────────
+        private void ZapiszLog(string komunikat)
+        {
+            try
+            {
+                Directory.CreateDirectory("Raporty");
+                string plik = Path.Combine("Raporty", "errors.log");
+                string linia = $"{DateTime.Now:yyyy-MM-dd HH:mm:ss} {komunikat}";
+                lock (_logLock)
+                    File.AppendAllText(plik, linia + Environment.NewLine);
+            }
+            catch { }
         }
     }
 }
