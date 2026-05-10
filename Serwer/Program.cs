@@ -15,8 +15,12 @@ class Server
 
     const int MAX_CACHE_ENTRIES = 30;
 
-    static readonly Dictionary<string, (HashSet<string> ngramy, Dictionary<string, (int od, int do_)> pozycje)> cache
-        = new Dictionary<string, (HashSet<string>, Dictionary<string, (int, int)>)>();
+    // LRU cache: trzymamy LinkedListNode bezpośrednio w słowniku,
+    // dzięki czemu Remove() jest O(1) zamiast O(n).
+    static readonly Dictionary<string, (LinkedListNode<string> node,
+        HashSet<string> ngramy, Dictionary<string, (int od, int do_)> pozycje)> cache
+        = new Dictionary<string, (LinkedListNode<string>,
+            HashSet<string>, Dictionary<string, (int, int)>)>();
 
     static readonly LinkedList<string> cacheKolejnosc = new LinkedList<string>();
     static readonly object cacheLock = new object();
@@ -24,12 +28,25 @@ class Server
     const int MAX_ROWNOLEGLOSCI = 8;
     static readonly SemaphoreSlim semafor = new SemaphoreSlim(MAX_ROWNOLEGLOSCI, MAX_ROWNOLEGLOSCI);
 
-    static readonly object consoleLock = new object();
+    // Logger nieblokujący: wątki robocze wrzucają string do kolejki (O(1)),
+    // dedykowany wątek tła wypisuje na konsolę — nikt nie czeka na Console.WriteLine.
+    static readonly System.Collections.Concurrent.BlockingCollection<string> _logQueue
+        = new System.Collections.Concurrent.BlockingCollection<string>(1024);
+
+    static Server()
+    {
+        var t = new Thread(() =>
+        {
+            foreach (string msg in _logQueue.GetConsumingEnumerable())
+                Console.WriteLine(msg);
+        });
+        t.IsBackground = true;
+        t.Start();
+    }
 
     static void Log(string komunikat)
     {
-        lock (consoleLock)
-            Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] {komunikat}");
+        _logQueue.TryAdd($"[{DateTime.Now:HH:mm:ss}] {komunikat}");
     }
 
     static void Main()
@@ -142,11 +159,12 @@ class Server
 
         lock (cacheLock)
         {
-            if (cache.ContainsKey(klucz))
+            if (cache.TryGetValue(klucz, out var wpis))
             {
-                cacheKolejnosc.Remove(klucz);
-                cacheKolejnosc.AddLast(klucz);
-                return cache[klucz];
+                // O(1) — mamy węzeł bezpośrednio, nie szukamy po liście
+                cacheKolejnosc.Remove(wpis.node);
+                cacheKolejnosc.AddLast(wpis.node);
+                return (wpis.ngramy, wpis.pozycje);
             }
         }
 
@@ -163,8 +181,8 @@ class Server
                     cacheKolejnosc.RemoveFirst();
                     cache.Remove(najstarszy);
                 }
-                cache[klucz] = wynik;
-                cacheKolejnosc.AddLast(klucz);
+                var node = cacheKolejnosc.AddLast(klucz);
+                cache[klucz] = (node, wynik.ngramy, wynik.pozycje);
             }
         }
 

@@ -401,28 +401,41 @@ namespace GUI
         }
 
         // ── Podświetlanie fragmentów ─────────────────────────────────────────
+        // NAPRAWA: poprzednio każde rtb.Select() triggerowało redraw i eventy UI.
+        // Przy dużych plikach (setki zakresów) powodowało to crash lub zamrożenie.
+        // Teraz: chowamy kontrolkę na czas operacji (zatrzymuje wszystkie redraws),
+        // po zakończeniu pokazujemy ją z powrotem — jedno odświeżenie zamiast setek.
         private void PodswietlFragmenty(RichTextBox rtb, List<Zakres> zakresy)
         {
-            rtb.SelectAll();
-            rtb.SelectionBackColor = Color.White;
-
-            if (zakresy == null) return;
-
-            foreach (var zakres in zakresy)
+            rtb.Visible = false;
+            try
             {
-                int od = zakres.od;
-                int dlugosc = zakres.do_ - zakres.od;
+                rtb.SelectAll();
+                rtb.SelectionBackColor = Color.White;
 
-                if (od < 0 || od >= rtb.Text.Length) continue;
-                if (od + dlugosc > rtb.Text.Length)
-                    dlugosc = rtb.Text.Length - od;
-                if (dlugosc <= 0) continue;
+                if (zakresy != null)
+                {
+                    foreach (var zakres in zakresy)
+                    {
+                        int od = zakres.od;
+                        int dlugosc = zakres.do_ - zakres.od;
 
-                rtb.Select(od, dlugosc);
-                rtb.SelectionBackColor = Color.Yellow;
+                        if (od < 0 || od >= rtb.TextLength) continue;
+                        if (od + dlugosc > rtb.TextLength)
+                            dlugosc = rtb.TextLength - od;
+                        if (dlugosc <= 0) continue;
+
+                        rtb.Select(od, dlugosc);
+                        rtb.SelectionBackColor = Color.Yellow;
+                    }
+                }
+
+                rtb.Select(0, 0);
             }
-
-            rtb.Select(0, 0);
+            finally
+            {
+                rtb.Visible = true;
+            }
         }
 
         // ── Wczytywanie wyników z folderu ────────────────────────────────────
