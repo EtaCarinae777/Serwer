@@ -8,25 +8,37 @@ using System.Text;
 using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
-using static System.Net.Mime.MediaTypeNames;
 using Newtonsoft.Json;
 
 class Server
 {
     static int port = 8001;
 
-    // cache przechowuje juz obliczone ngramy dla kazdego pliku
-    // klucz = nazwa pliku + rozmiar tekstu + n
-    static Dictionary<string, (HashSet<string> ngramy, Dictionary<string, (int od, int do_)> pozycje)> cache
+    // ── LRU Cache ────────────────────────────────────────────────────────────
+    // Klucz = nazwa pliku + długość tekstu + n
+    // Trzymamy maksymalnie MAX_CACHE_ENTRIES wpisów żeby nie zjeść całej RAM.
+    // Przy przekroczeniu limitu usuwamy najdawniej używany wpis (LRU).
+    const int MAX_CACHE_ENTRIES = 30;
+
+    static readonly Dictionary<string, (HashSet<string> ngramy, Dictionary<string, (int od, int do_)> pozycje)> cache
         = new Dictionary<string, (HashSet<string>, Dictionary<string, (int, int)>)>();
 
-    // lock do synchronizacji dostepu do cache z wielu watkow
+    // Lista kluczy w kolejności ostatniego użycia (tył = najnowszy)
+    static readonly LinkedList<string> cacheKolejnosc = new LinkedList<string>();
+
     static readonly object cacheLock = new object();
+
+    // ── Semafory ──────────────────────────────────────────────────────────────
+    // Ograniczamy liczbę jednoczesnych żądań żeby nie dopuścić do OOM
+    // pod dużym obciążeniem. Wartość = ile zadań może działać równolegle.
+    const int MAX_ROWNOLEGLOSCI = 4;
+    static readonly SemaphoreSlim semafor = new SemaphoreSlim(MAX_ROWNOLEGLOSCI, MAX_ROWNOLEGLOSCI);
 
     static void Main()
     {
         TcpListener serwer = new TcpListener(IPAddress.Any, port);
         serwer.Start();
+        Console.WriteLine($"[SERWER] Nasłuchuje na porcie {port}. Max równoległości: {MAX_ROWNOLEGLOSCI}, max cache: {MAX_CACHE_ENTRIES}.");
 
         while (true)
         {
@@ -40,12 +52,15 @@ class Server
         string nazwa = reader.ReadString();
         long rozmiar = reader.ReadInt64();
         byte[] dane = reader.ReadBytes((int)rozmiar);
-
-        return (nazwa, System.Text.Encoding.UTF8.GetString(dane));
+        return (nazwa, Encoding.UTF8.GetString(dane));
     }
 
     static void ObsluzKlienta(TcpClient klient)
     {
+        // Czekamy na wolne miejsce — jeśli serwer jest zajęty, klient poczeka
+        // zamiast dostawać OOM przy zbyt wielu równoległych żądaniach.
+        semafor.Wait();
+
         try
         {
             using (NetworkStream stream = klient.GetStream())
@@ -60,8 +75,7 @@ class Server
 
                 var stoper = System.Diagnostics.Stopwatch.StartNew();
 
-                // pobieramy ngramy z cache lub liczymy jesli pierwsza wizyta
-                // oba pliki tokenizowane rownoleglie
+                // Oba pliki tokenizowane równolegle
                 var task1 = Task.Run(() => PobierzNgramy(nazwa1, tekst1, n));
                 var task2 = Task.Run(() => PobierzNgramy(nazwa2, tekst2, n));
                 Task.WaitAll(task1, task2);
@@ -69,31 +83,31 @@ class Server
                 var (ngramy1, pozycje1) = task1.Result;
                 var (ngramy2, pozycje2) = task2.Result;
 
-                //intersection - czesc wspolna n-gramow
+                // Intersection — część wspólna n-gramów
                 var intersection = new HashSet<string>(ngramy1);
                 intersection.IntersectWith(ngramy2);
 
-                //jaccard - podobienstwo w procentach
-                double Jaccard = ObliczJaccard(ngramy1, ngramy2);
+                // Jaccard — podobieństwo w procentach
+                double jaccard = ObliczJaccard(ngramy1, ngramy2);
 
-                //dwustronne podobienstwo
+                // Dwustronne podobieństwo
                 var (aDoB, bDoA) = ObliczDwustronne(ngramy1, ngramy2);
 
-                // zakresy podobnych fragmentow
+                // Zakresy podobnych fragmentów
                 var zakresy1 = ZnajdzPodobneZakresy(pozycje1, intersection);
                 var zakresy2 = ZnajdzPodobneZakresy(pozycje2, intersection);
 
                 stoper.Stop();
                 long czasObliczenMs = stoper.ElapsedMilliseconds;
 
-                string csvContent = GenerujCSV(nazwa1, nazwa2, Jaccard, aDoB, bDoA, zakresy1, zakresy2);
+                string csvContent = GenerujCSV(nazwa1, nazwa2, jaccard, aDoB, bDoA, zakresy1, zakresy2);
 
-                // wysylamy wyniki
-                writer.Write(Jaccard);
+                // Wyniki liczbowe
+                writer.Write(jaccard);
                 writer.Write(aDoB);
                 writer.Write(bDoA);
 
-                // wysylamy zakresy pliku 1
+                // Zakresy pliku 1
                 writer.Write(zakresy1.Count);
                 foreach (var (od, do_) in zakresy1)
                 {
@@ -101,7 +115,7 @@ class Server
                     writer.Write(do_);
                 }
 
-                // wysylamy zakresy pliku 2
+                // Zakresy pliku 2
                 writer.Write(zakresy2.Count);
                 foreach (var (od, do_) in zakresy2)
                 {
@@ -109,10 +123,10 @@ class Server
                     writer.Write(do_);
                 }
 
+                // JSON bez pełnych tekstów — klient je już ma lokalnie
                 string jsonContent = GenerujJSON(
                     nazwa1, nazwa2,
-                    tekst1, tekst2,
-                    Jaccard, aDoB, bDoA,
+                    jaccard, aDoB, bDoA,
                     zakresy1, zakresy2);
 
                 writer.Write(csvContent);
@@ -124,36 +138,57 @@ class Server
         {
             Console.WriteLine($"[SERWER] Blad: {e.Message}");
         }
+        finally
+        {
+            // Zawsze zwalniamy semafor — nawet przy wyjątku
+            semafor.Release();
+            klient.Close();
+        }
     }
 
-    // pobiera ngramy z cache lub oblicza je jesli jeszcze nie ma
+    // ── LRU Cache — pobieranie / wstawianie ──────────────────────────────────
     static (HashSet<string> ngramy, Dictionary<string, (int od, int do_)> pozycje)
         PobierzNgramy(string nazwaPliku, string tekst, int n)
     {
-        // klucz = nazwa pliku + rozmiar tekstu + n
-        // jesli plik sie zmienil (inny rozmiar) liczymy od nowa
         string klucz = nazwaPliku + "_" + tekst.Length + "_n" + n;
 
         lock (cacheLock)
         {
             if (cache.ContainsKey(klucz))
+            {
+                // Przenosimy klucz na koniec listy (najnowszy)
+                cacheKolejnosc.Remove(klucz);
+                cacheKolejnosc.AddLast(klucz);
                 return cache[klucz];
+            }
         }
 
-        // nie ma w cache - liczymy
+        // Obliczamy poza lockiem żeby nie blokować innych wątków
         var tokeny = PodzielNaSlowa(tekst);
         var wynik = GenerujNgramy(tokeny, n);
 
         lock (cacheLock)
         {
             if (!cache.ContainsKey(klucz))
+            {
+                // Jeśli cache jest pełny — wyrzucamy najdawniej używany wpis (LRU)
+                if (cache.Count >= MAX_CACHE_ENTRIES)
+                {
+                    string najstarszy = cacheKolejnosc.First.Value;
+                    cacheKolejnosc.RemoveFirst();
+                    cache.Remove(najstarszy);
+                    Console.WriteLine($"[CACHE] Usunieto najstarszy wpis: {najstarszy}");
+                }
+
                 cache[klucz] = wynik;
+                cacheKolejnosc.AddLast(klucz);
+                Console.WriteLine($"[CACHE] Dodano: {klucz} (rozmiar cache: {cache.Count}/{MAX_CACHE_ENTRIES})");
+            }
         }
 
         return wynik;
     }
 
-    // na razie liczy slowa, pozniej zastapiona przez PorownajPliki()
     static int LiczSlowa(string tekst)
     {
         string[] slowa = tekst.Split(new char[] { ' ', '\t', '\n', '\r' },
@@ -161,17 +196,11 @@ class Server
         return slowa.Length;
     }
 
-    // glowna funkcja porownujaca dwa teksty
-    // zwraca podobienstwo w procentach (0.0 - 100.0)
     static double PorownajPliki(string tekstA, string tekstB, int n)
     {
-        // TODO: wywolac GenerujNgramy dla obu tekstow
-        // TODO: wywolac ObliczJaccard na zbiorach n-gramow
         return 0.0;
     }
 
-    // dzieli tekst na tokeny zachowujac pozycje w oryginalnym tekscie
-    // zwraca liste (slowo, pozycja_poczatku, pozycja_konca)
     static List<(string slowo, int od, int do_)> PodzielNaSlowa(string tekst)
     {
         var tokeny = new List<(string slowo, int od, int do_)>();
@@ -179,21 +208,17 @@ class Server
 
         while (i < tekst.Length)
         {
-            // pomijamy znaki niebedace literami ani cyframi
             if (!char.IsLetterOrDigit(tekst[i]))
             {
                 i++;
                 continue;
             }
 
-            // znalezlismy poczatek slowa
             int poczatek = i;
 
-            // idziemy do konca slowa
             while (i < tekst.Length && char.IsLetterOrDigit(tekst[i]))
                 i++;
 
-            // zapisujemy slowo z pozycjami w oryginalnym tekscie
             string slowo = tekst.Substring(poczatek, i - poczatek).ToLower();
             tokeny.Add((slowo, poczatek, i));
         }
@@ -201,9 +226,6 @@ class Server
         return tokeny;
     }
 
-    // generuje n-gramy z tokenow
-    // zwraca zbior n-gramow (do Jaccarda)
-    // oraz slownik ngram -> (od, do) potrzebny do podswietlania
     static (HashSet<string> ngramy, Dictionary<string, (int od, int do_)> pozycje)
         GenerujNgramy(List<(string slowo, int od, int do_)> tokeny, int n)
     {
@@ -212,11 +234,9 @@ class Server
 
         for (int i = 0; i <= tokeny.Count - n; i++)
         {
-            // laczmy n slow w jeden ngram
             string ngram = string.Join(" ", tokeny.GetRange(i, n).Select(t => t.slowo));
             ngramy.Add(ngram);
 
-            // zapamietujemy pozycje pierwszego i ostatniego slowa w oryginalnym tekscie
             if (!pozycje.ContainsKey(ngram))
                 pozycje[ngram] = (tokeny[i].od, tokeny[i + n - 1].do_);
         }
@@ -224,16 +244,14 @@ class Server
         return (ngramy, pozycje);
     }
 
-    // oblicza wspolczynnik Jaccarda dla dwoch zbiorow n-gramow
     static double ObliczJaccard(HashSet<string> ngramyA, HashSet<string> ngramyB)
     {
-        // TODO: obliczyc czesc wspolna (intersection)
         var intersection = new HashSet<string>(ngramyA);
         intersection.IntersectWith(ngramyB);
-        // TODO: obliczyc sume zbiorow (union)
+
         var union = new HashSet<string>(ngramyA);
         union.UnionWith(ngramyB);
-        // TODO: podzielic i zwrocic wynik * 100
+
         if (union.Count == 0) return 0;
 
         return (double)intersection.Count / union.Count * 100.0;
@@ -253,8 +271,6 @@ class Server
         return (aDoB, bDoA);
     }
 
-    // zamiast zdan zwraca liste zakresow (od, do) w oryginalnym tekscie
-    // dzieki temu GUI moze bezposrednio podswietlic fragmenty
     static List<(int od, int do_)> ZnajdzPodobneZakresy(
         Dictionary<string, (int od, int do_)> pozycje,
         HashSet<string> wspolneNgramy)
@@ -267,10 +283,8 @@ class Server
                 zakresy.Add(pozycje[ngram]);
         }
 
-        // sortujemy po pozycji poczatku
         zakresy.Sort((a, b) => a.od.CompareTo(b.od));
 
-        // laczymy zakresy ktore sie nakladaja lub stykaja
         var polaczone = new List<(int od, int do_)>();
         foreach (var zakres in zakresy)
         {
@@ -314,11 +328,11 @@ class Server
         return sw.ToString();
     }
 
+    // JSON bez pełnych tekstów plików — klient je już ma lokalnie,
+    // nie ma sensu przesyłać ich z powrotem przez sieć (ogromna oszczędność RAM i pasma).
     static string GenerujJSON(
         string nazwaA,
         string nazwaB,
-        string tekstA,
-        string tekstB,
         double jaccard,
         double aDoB,
         double bDoA,
@@ -332,19 +346,15 @@ class Server
             jaccard = Math.Round(jaccard, 2),
             aDoB = Math.Round(aDoB, 2),
             bDoA = Math.Round(bDoA, 2),
-            tekstA = tekstA,
-            tekstB = tekstB,
             zakresy1 = zakresy1.Select(z => new { od = z.od, do_ = z.do_ }).ToList(),
             zakresy2 = zakresy2.Select(z => new { od = z.od, do_ = z.do_ }).ToList()
         };
 
-        return Newtonsoft.Json.JsonConvert.SerializeObject(dane, Newtonsoft.Json.Formatting.Indented);
+        return JsonConvert.SerializeObject(dane, Formatting.Indented);
     }
 
-    // sprawdza czy wynik przekracza prog plagiatu
     static bool CzyPlagiat(double podobienstwo, double prog)
     {
-        // TODO: prosta comparacja podobienstwo >= prog
-        return false;
+        return podobienstwo >= prog;
     }
 }
