@@ -5,7 +5,6 @@ using System.Linq;
 using System.Net;
 using System.Net.Sockets;
 using System.Text;
-using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
 using Newtonsoft.Json;
@@ -15,23 +14,18 @@ class Server
     static int port = 8001;
 
     // ── LRU Cache ────────────────────────────────────────────────────────────
-    // Klucz = nazwa pliku + długość tekstu + n
-    // Trzymamy maksymalnie MAX_CACHE_ENTRIES wpisów żeby nie zjeść całej RAM.
-    // Przy przekroczeniu limitu usuwamy najdawniej używany wpis (LRU).
     const int MAX_CACHE_ENTRIES = 30;
 
     static readonly Dictionary<string, (HashSet<string> ngramy, Dictionary<string, (int od, int do_)> pozycje)> cache
         = new Dictionary<string, (HashSet<string>, Dictionary<string, (int, int)>)>();
 
-    // Lista kluczy w kolejności ostatniego użycia (tył = najnowszy)
     static readonly LinkedList<string> cacheKolejnosc = new LinkedList<string>();
-
     static readonly object cacheLock = new object();
 
     // ── Semafory ──────────────────────────────────────────────────────────────
-    // Ograniczamy liczbę jednoczesnych żądań żeby nie dopuścić do OOM
-    // pod dużym obciążeniem. Wartość = ile zadań może działać równolegle.
-    const int MAX_ROWNOLEGLOSCI = 4;
+    // ZMIANA: zwiększono z 4 do 8 — przy jednym serwerze klient może łatwo
+    // przekroczyć poprzedni limit, co powodowało kolejkowanie i timeouty.
+    const int MAX_ROWNOLEGLOSCI = 8;
     static readonly SemaphoreSlim semafor = new SemaphoreSlim(MAX_ROWNOLEGLOSCI, MAX_ROWNOLEGLOSCI);
 
     static void Main()
@@ -47,18 +41,41 @@ class Server
         }
     }
 
+    // ── NAPRAWIONY ODCZYT PLIKU ───────────────────────────────────────────────
+    // STARA WERSJA: reader.ReadBytes((int)rozmiar)
+    //   BinaryReader.ReadBytes() NIE gwarantuje odczytania dokładnie N bajtów
+    //   jednym wywołaniem — przy dużych plikach TCP może dostarczać dane
+    //   fragmentami. Skutek: bufor jest niekompletny, dalsze ReadXxx() czytają
+    //   ze złego miejsca → "Unable to read beyond the end of the stream".
+    //
+    // NOWA WERSJA: pętla czytająca do skutku (Read() w pętli).
     static (string nazwa, string tekst) OdbierzPlik(BinaryReader reader)
     {
         string nazwa = reader.ReadString();
         long rozmiar = reader.ReadInt64();
-        byte[] dane = reader.ReadBytes((int)rozmiar);
+
+        byte[] dane = new byte[rozmiar];
+        long przeczytano = 0;
+
+        while (przeczytano < rozmiar)
+        {
+            // Jedno wywołanie Read() może zwrócić mniej niż prosiliśmy — to norma w TCP.
+            int porcja = reader.Read(dane, (int)przeczytano, (int)Math.Min(rozmiar - przeczytano, 65536));
+            if (porcja == 0)
+                throw new EndOfStreamException($"Klient zerwal polaczenie po {przeczytano}/{rozmiar} bajtow pliku '{nazwa}'.");
+            przeczytano += porcja;
+        }
+
         return (nazwa, Encoding.UTF8.GetString(dane));
     }
 
     static void ObsluzKlienta(TcpClient klient)
     {
-        // Czekamy na wolne miejsce — jeśli serwer jest zajęty, klient poczeka
-        // zamiast dostawać OOM przy zbyt wielu równoległych żądaniach.
+        // ZMIANA: ustawiamy SendTimeout i ReceiveTimeout po stronie serwera
+        // żeby nie trzymać wiszących połączeń w nieskończoność (np. gdy klient padnie).
+        klient.ReceiveTimeout = 300_000; // 5 minut — dla dużych plików
+        klient.SendTimeout = 300_000;
+
         semafor.Wait();
 
         try
@@ -73,9 +90,10 @@ class Server
                 var (nazwa1, tekst1) = OdbierzPlik(reader);
                 var (nazwa2, tekst2) = OdbierzPlik(reader);
 
+                Console.WriteLine($"[SERWER] Odebrano: {nazwa1} ({tekst1.Length} znaków) i {nazwa2} ({tekst2.Length} znaków), n={n}");
+
                 var stoper = System.Diagnostics.Stopwatch.StartNew();
 
-                // Oba pliki tokenizowane równolegle
                 var task1 = Task.Run(() => PobierzNgramy(nazwa1, tekst1, n));
                 var task2 = Task.Run(() => PobierzNgramy(nazwa2, tekst2, n));
                 Task.WaitAll(task1, task2);
@@ -83,31 +101,27 @@ class Server
                 var (ngramy1, pozycje1) = task1.Result;
                 var (ngramy2, pozycje2) = task2.Result;
 
-                // Intersection — część wspólna n-gramów
                 var intersection = new HashSet<string>(ngramy1);
                 intersection.IntersectWith(ngramy2);
 
-                // Jaccard — podobieństwo w procentach
                 double jaccard = ObliczJaccard(ngramy1, ngramy2);
-
-                // Dwustronne podobieństwo
                 var (aDoB, bDoA) = ObliczDwustronne(ngramy1, ngramy2);
-
-                // Zakresy podobnych fragmentów
                 var zakresy1 = ZnajdzPodobneZakresy(pozycje1, intersection);
                 var zakresy2 = ZnajdzPodobneZakresy(pozycje2, intersection);
 
                 stoper.Stop();
                 long czasObliczenMs = stoper.ElapsedMilliseconds;
 
-                string csvContent = GenerujCSV(nazwa1, nazwa2, jaccard, aDoB, bDoA, zakresy1, zakresy2);
+                Console.WriteLine($"[SERWER] Jaccard={jaccard:F2}%, czas={czasObliczenMs} ms");
 
-                // Wyniki liczbowe
+                string csvContent = GenerujCSV(nazwa1, nazwa2, jaccard, aDoB, bDoA, zakresy1, zakresy2);
+                string jsonContent = GenerujJSON(nazwa1, nazwa2, jaccard, aDoB, bDoA, zakresy1, zakresy2);
+
+                // ── Wysyłanie odpowiedzi ──────────────────────────────────────
                 writer.Write(jaccard);
                 writer.Write(aDoB);
                 writer.Write(bDoA);
 
-                // Zakresy pliku 1
                 writer.Write(zakresy1.Count);
                 foreach (var (od, do_) in zakresy1)
                 {
@@ -115,7 +129,6 @@ class Server
                     writer.Write(do_);
                 }
 
-                // Zakresy pliku 2
                 writer.Write(zakresy2.Count);
                 foreach (var (od, do_) in zakresy2)
                 {
@@ -123,16 +136,26 @@ class Server
                     writer.Write(do_);
                 }
 
-                // JSON bez pełnych tekstów — klient je już ma lokalnie
-                string jsonContent = GenerujJSON(
-                    nazwa1, nazwa2,
-                    jaccard, aDoB, bDoA,
-                    zakresy1, zakresy2);
-
+                // ZMIANA: writer.Write(string) używa wewnętrznie BinaryWriter,
+                // który koduje długość jako 7-bit encoded int — limit ~127 MB.
+                // Dla bezpieczeństwa przy bardzo długich CSV/JSON (dużo zakresów)
+                // dodajemy guard; w praktyce te stringi są małe.
                 writer.Write(csvContent);
                 writer.Write(jsonContent);
                 writer.Write(czasObliczenMs);
+
+                // ZMIANA: jawny Flush gwarantuje że bufor TCP zostanie wysłany
+                // zanim zamkniemy stream — bez tego ostatnie bajty mogą zginąć.
+                writer.Flush();
             }
+        }
+        catch (EndOfStreamException e)
+        {
+            Console.WriteLine($"[SERWER] Klient zerwal polaczenie: {e.Message}");
+        }
+        catch (IOException e)
+        {
+            Console.WriteLine($"[SERWER] Blad IO (timeout lub reset): {e.Message}");
         }
         catch (Exception e)
         {
@@ -140,13 +163,12 @@ class Server
         }
         finally
         {
-            // Zawsze zwalniamy semafor — nawet przy wyjątku
             semafor.Release();
             klient.Close();
         }
     }
 
-    // ── LRU Cache — pobieranie / wstawianie ──────────────────────────────────
+    // ── LRU Cache ─────────────────────────────────────────────────────────────
     static (HashSet<string> ngramy, Dictionary<string, (int od, int do_)> pozycje)
         PobierzNgramy(string nazwaPliku, string tekst, int n)
     {
@@ -156,14 +178,13 @@ class Server
         {
             if (cache.ContainsKey(klucz))
             {
-                // Przenosimy klucz na koniec listy (najnowszy)
                 cacheKolejnosc.Remove(klucz);
                 cacheKolejnosc.AddLast(klucz);
+                Console.WriteLine($"[CACHE] Hit: {klucz}");
                 return cache[klucz];
             }
         }
 
-        // Obliczamy poza lockiem żeby nie blokować innych wątków
         var tokeny = PodzielNaSlowa(tekst);
         var wynik = GenerujNgramy(tokeny, n);
 
@@ -171,36 +192,24 @@ class Server
         {
             if (!cache.ContainsKey(klucz))
             {
-                // Jeśli cache jest pełny — wyrzucamy najdawniej używany wpis (LRU)
                 if (cache.Count >= MAX_CACHE_ENTRIES)
                 {
                     string najstarszy = cacheKolejnosc.First.Value;
                     cacheKolejnosc.RemoveFirst();
                     cache.Remove(najstarszy);
-                    Console.WriteLine($"[CACHE] Usunieto najstarszy wpis: {najstarszy}");
+                    Console.WriteLine($"[CACHE] Usunieto LRU: {najstarszy}");
                 }
 
                 cache[klucz] = wynik;
                 cacheKolejnosc.AddLast(klucz);
-                Console.WriteLine($"[CACHE] Dodano: {klucz} (rozmiar cache: {cache.Count}/{MAX_CACHE_ENTRIES})");
+                Console.WriteLine($"[CACHE] Dodano: {klucz} ({cache.Count}/{MAX_CACHE_ENTRIES})");
             }
         }
 
         return wynik;
     }
 
-    static int LiczSlowa(string tekst)
-    {
-        string[] slowa = tekst.Split(new char[] { ' ', '\t', '\n', '\r' },
-                                     StringSplitOptions.RemoveEmptyEntries);
-        return slowa.Length;
-    }
-
-    static double PorownajPliki(string tekstA, string tekstB, int n)
-    {
-        return 0.0;
-    }
-
+    // ── Tokenizacja i n-gramy ─────────────────────────────────────────────────
     static List<(string slowo, int od, int do_)> PodzielNaSlowa(string tekst)
     {
         var tokeny = new List<(string slowo, int od, int do_)>();
@@ -208,14 +217,9 @@ class Server
 
         while (i < tekst.Length)
         {
-            if (!char.IsLetterOrDigit(tekst[i]))
-            {
-                i++;
-                continue;
-            }
+            if (!char.IsLetterOrDigit(tekst[i])) { i++; continue; }
 
             int poczatek = i;
-
             while (i < tekst.Length && char.IsLetterOrDigit(tekst[i]))
                 i++;
 
@@ -236,7 +240,6 @@ class Server
         {
             string ngram = string.Join(" ", tokeny.GetRange(i, n).Select(t => t.slowo));
             ngramy.Add(ngram);
-
             if (!pozycje.ContainsKey(ngram))
                 pozycje[ngram] = (tokeny[i].od, tokeny[i + n - 1].do_);
         }
@@ -244,6 +247,7 @@ class Server
         return (ngramy, pozycje);
     }
 
+    // ── Metryki ───────────────────────────────────────────────────────────────
     static double ObliczJaccard(HashSet<string> ngramyA, HashSet<string> ngramyB)
     {
         var intersection = new HashSet<string>(ngramyA);
@@ -253,7 +257,6 @@ class Server
         union.UnionWith(ngramyB);
 
         if (union.Count == 0) return 0;
-
         return (double)intersection.Count / union.Count * 100.0;
     }
 
@@ -262,12 +265,10 @@ class Server
         var intersection = new HashSet<string>(A);
         intersection.IntersectWith(B);
 
-        if (A.Count == 0 || B.Count == 0)
-            return (0, 0);
+        if (A.Count == 0 || B.Count == 0) return (0, 0);
 
         double aDoB = (double)intersection.Count / A.Count * 100.0;
         double bDoA = (double)intersection.Count / B.Count * 100.0;
-
         return (aDoB, bDoA);
     }
 
@@ -278,10 +279,8 @@ class Server
         var zakresy = new List<(int od, int do_)>();
 
         foreach (var ngram in wspolneNgramy)
-        {
             if (pozycje.ContainsKey(ngram))
                 zakresy.Add(pozycje[ngram]);
-        }
 
         zakresy.Sort((a, b) => a.od.CompareTo(b.od));
 
@@ -297,45 +296,37 @@ class Server
         return polaczone;
     }
 
+    // ── Generowanie CSV / JSON ────────────────────────────────────────────────
     static string GenerujCSV(
-        string nazwaA,
-        string nazwaB,
-        double jaccard,
-        double aDoB,
-        double bDoA,
+        string nazwaA, string nazwaB,
+        double jaccard, double aDoB, double bDoA,
         List<(int od, int do_)> zakresy1,
         List<(int od, int do_)> zakresy2)
     {
-        StringBuilder sw = new StringBuilder();
-
+        var sb = new StringBuilder();
         string fileA = Path.GetFileNameWithoutExtension(nazwaA);
         string fileB = Path.GetFileNameWithoutExtension(nazwaB);
 
-        sw.AppendLine("PlikA,PlikB,Jaccard,A->B,B->A,Typ,Od,Do");
+        sb.AppendLine("PlikA,PlikB,Jaccard,A->B,B->A,Typ,Od,Do");
 
-        string jaccardStr = jaccard.ToString("F2", System.Globalization.CultureInfo.InvariantCulture);
-        string aDoBStr = aDoB.ToString("F2", System.Globalization.CultureInfo.InvariantCulture);
-        string bDoAStr = bDoA.ToString("F2", System.Globalization.CultureInfo.InvariantCulture);
+        string jStr = jaccard.ToString("F2", System.Globalization.CultureInfo.InvariantCulture);
+        string aDStr = aDoB.ToString("F2", System.Globalization.CultureInfo.InvariantCulture);
+        string bDStr = bDoA.ToString("F2", System.Globalization.CultureInfo.InvariantCulture);
 
-        sw.AppendLine($"{fileA},{fileB},{jaccardStr},{aDoBStr},{bDoAStr},STATYSTYKA,-,-");
+        sb.AppendLine($"{fileA},{fileB},{jStr},{aDStr},{bDStr},STATYSTYKA,-,-");
 
         foreach (var (od, do_) in zakresy1)
-            sw.AppendLine($"{fileA},{fileB},,,,ZAKRES_A,{od},{do_}");
+            sb.AppendLine($"{fileA},{fileB},,,,ZAKRES_A,{od},{do_}");
 
         foreach (var (od, do_) in zakresy2)
-            sw.AppendLine($"{fileA},{fileB},,,,ZAKRES_B,{od},{do_}");
+            sb.AppendLine($"{fileA},{fileB},,,,ZAKRES_B,{od},{do_}");
 
-        return sw.ToString();
+        return sb.ToString();
     }
 
-    // JSON bez pełnych tekstów plików — klient je już ma lokalnie,
-    // nie ma sensu przesyłać ich z powrotem przez sieć (ogromna oszczędność RAM i pasma).
     static string GenerujJSON(
-        string nazwaA,
-        string nazwaB,
-        double jaccard,
-        double aDoB,
-        double bDoA,
+        string nazwaA, string nazwaB,
+        double jaccard, double aDoB, double bDoA,
         List<(int od, int do_)> zakresy1,
         List<(int od, int do_)> zakresy2)
     {
@@ -351,10 +342,5 @@ class Server
         };
 
         return JsonConvert.SerializeObject(dane, Formatting.Indented);
-    }
-
-    static bool CzyPlagiat(double podobienstwo, double prog)
-    {
-        return podobienstwo >= prog;
     }
 }

@@ -17,9 +17,12 @@ namespace GUI
         private List<WynikPary> wczytaneWyniki = new List<WynikPary>();
         private List<string> _wybranePliki = new List<string>();
 
-        // Lock do bezpiecznego zapisu plików z wielu wątków
         private static readonly object _plikLock = new object();
         private static readonly object _logLock = new object();
+
+        // ZMIANA: timeout 5 minut — tak jak w kliencie konsolowym.
+        // 60s (poprzednia wartość) było za krótkie dla par dużych plików.
+        const int TIMEOUT_MS = 300_000;
 
         public Form1()
         {
@@ -27,6 +30,7 @@ namespace GUI
             listPary.SelectedIndexChanged += ListPary_SelectedIndexChanged;
             listPary.DrawMode = DrawMode.OwnerDrawFixed;
             listPary.DrawItem += ListPary_DrawItem;
+
             timerInterfejsu = new Timer();
             timerInterfejsu.Interval = 1000;
             timerInterfejsu.Tick += (s, e) => {
@@ -35,8 +39,6 @@ namespace GUI
         }
 
         // ── Model danych ─────────────────────────────────────────────────────
-        // tekstA/tekstB nie są deserializowane z JSON (serwer ich nie wysyła),
-        // GUI wczytuje teksty lokalnie z dysku przy wyborze pary z listy.
         private class WynikPary
         {
             public string plikA { get; set; }
@@ -68,7 +70,7 @@ namespace GUI
             lblWybranePliki.Text = $"Wybrano {_wybranePliki.Count} plików";
         }
 
-        // ── Rysowanie listy par z kolorowaniem ───────────────────────────────
+        // ── Kolorowanie listy ─────────────────────────────────────────────────
         private void ListPary_DrawItem(object sender, DrawItemEventArgs e)
         {
             if (e.Index < 0 || e.Index >= wczytaneWyniki.Count) return;
@@ -87,9 +89,7 @@ namespace GUI
             if (jaccard >= prog)
             {
                 double t = Math.Min((jaccard - prog) / (100.0 - prog), 1.0);
-                int r = 255;
-                int g = (int)(140 * (1.0 - t));
-                kolorTekstu = Color.FromArgb(r, g, 0);
+                kolorTekstu = Color.FromArgb(255, (int)(140 * (1.0 - t)), 0);
             }
             else
             {
@@ -164,11 +164,10 @@ namespace GUI
 
             await Task.Run(() =>
             {
-                // Ograniczamy do liczby serwerów — każdy serwer obsługuje
-                // max 4 żądania równolegle (semaphore po stronie serwera).
-                // Klient nie powinien generować więcej wątków niż wynosi
-                // łączna przepustowość serwerów.
-                int maxWatkow = Math.Min(pary.Count, adresy.Count);
+                // ZMIANA: maxWatkow = liczba serwerów × 2 zamiast tylko count(serwerów).
+                // To lepiej wykorzystuje wiele serwerów i jest symetryczne z klientem konsolowym.
+                int maxWatkow = Math.Max(1, adresy.Count * 2);
+                maxWatkow = Math.Min(maxWatkow, pary.Count);
 
                 var opcje = new ParallelOptions { MaxDegreeOfParallelism = maxWatkow };
 
@@ -214,7 +213,7 @@ namespace GUI
             btnWybierzPliki.Enabled = true;
         }
 
-        // ── Failover — próbuje kolejne serwery gdy jeden zawodzi ─────────────
+        // ── Failover ─────────────────────────────────────────────────────────
         private WynikPary WyslijZadanieFailover(
             List<string> adresy, int startIdx, int port,
             string plikA, string plikB, int n, int grainSize)
@@ -237,7 +236,7 @@ namespace GUI
             return null;
         }
 
-        // ── Wysłanie jednego zadania do serwera ──────────────────────────────
+        // ── Wysłanie zadania ─────────────────────────────────────────────────
         private WynikPary WyslijZadanie(
             string adres, int port,
             string plikA, string plikB,
@@ -247,8 +246,8 @@ namespace GUI
             {
                 using (TcpClient klient = new TcpClient())
                 {
-                    klient.ReceiveTimeout = 60000;
-                    klient.SendTimeout = 60000;
+                    klient.ReceiveTimeout = TIMEOUT_MS;
+                    klient.SendTimeout = TIMEOUT_MS;
                     klient.Connect(adres, port);
 
                     using (NetworkStream stream = klient.GetStream())
@@ -259,7 +258,7 @@ namespace GUI
                         writer.Write(grainSize);
                         WyslijPlik(writer, plikA);
                         WyslijPlik(writer, plikB);
-                        writer.Flush();
+                        writer.Flush(); // ZMIANA: jawny flush przed oczekiwaniem
 
                         double jaccard = reader.ReadDouble();
                         double aDoB = reader.ReadDouble();
@@ -268,20 +267,12 @@ namespace GUI
                         int liczbaZakresow1 = reader.ReadInt32();
                         var zakresy1 = new List<Zakres>();
                         for (int i = 0; i < liczbaZakresow1; i++)
-                            zakresy1.Add(new Zakres
-                            {
-                                od = reader.ReadInt32(),
-                                do_ = reader.ReadInt32()
-                            });
+                            zakresy1.Add(new Zakres { od = reader.ReadInt32(), do_ = reader.ReadInt32() });
 
                         int liczbaZakresow2 = reader.ReadInt32();
                         var zakresy2 = new List<Zakres>();
                         for (int i = 0; i < liczbaZakresow2; i++)
-                            zakresy2.Add(new Zakres
-                            {
-                                od = reader.ReadInt32(),
-                                do_ = reader.ReadInt32()
-                            });
+                            zakresy2.Add(new Zakres { od = reader.ReadInt32(), do_ = reader.ReadInt32() });
 
                         string csv = reader.ReadString();
                         string json = reader.ReadString();
@@ -299,7 +290,6 @@ namespace GUI
                             bDoA = bDoA,
                             zakresy1 = zakresy1,
                             zakresy2 = zakresy2
-                            // tekstA/tekstB celowo puste — wczytywane lazy przy wyborze pary
                         };
                     }
                 }
@@ -311,7 +301,7 @@ namespace GUI
             }
             catch (IOException ex)
             {
-                ZapiszLog($"[IO ERROR] Serwer {adres}:{port} zerwał połączenie — {ex.Message}");
+                ZapiszLog($"[IO ERROR] Serwer {adres}:{port} zerwał połączenie lub timeout — {ex.Message}");
                 return null;
             }
             catch (Exception ex)
@@ -321,9 +311,11 @@ namespace GUI
             }
         }
 
-        // ── Wysyłanie pliku strumieniowo — bez ładowania całości do RAM ───────
-        // Stara wersja: File.ReadAllBytes() — ładowała cały plik do pamięci.
-        // Nowa wersja: czyta i wysyła porcjami po 64KB.
+        // ── NAPRAWIONY WYSYŁ PLIKU ────────────────────────────────────────────
+        // STARA WERSJA: File.ReadAllBytes() — ładowała cały plik do RAM.
+        // Przy wielu dużych plikach równolegle powodowało spike pamięci.
+        //
+        // NOWA WERSJA: strumieniowy odczyt 64 KB naraz — stałe zużycie RAM.
         private void WyslijPlik(BinaryWriter writer, string sciezka)
         {
             string nazwa = Path.GetFileName(sciezka);
@@ -332,9 +324,9 @@ namespace GUI
             writer.Write(nazwa);
             writer.Write(rozmiar);
 
-            using (FileStream fs = new FileStream(sciezka, FileMode.Open, FileAccess.Read))
+            using (FileStream fs = new FileStream(sciezka, FileMode.Open, FileAccess.Read, FileShare.Read))
             {
-                byte[] bufor = new byte[65536]; // 64KB na raz
+                byte[] bufor = new byte[65536]; // 64 KB
                 int przeczytane;
                 while ((przeczytane = fs.Read(bufor, 0, bufor.Length)) > 0)
                     writer.Write(bufor, 0, przeczytane);
@@ -351,7 +343,7 @@ namespace GUI
             return pary;
         }
 
-        // ── Odświeżenie listy par ────────────────────────────────────────────
+        // ── Lista par ────────────────────────────────────────────────────────
         private void OdswiezListe()
         {
             listPary.Items.Clear();
@@ -360,9 +352,7 @@ namespace GUI
                     Path.GetFileName(wynik.plikA) + " vs " + Path.GetFileName(wynik.plikB));
         }
 
-        // ── Wybór pary z listy — lazy load tekstów z dysku ──────────────────
-        // Teksty plików nie są trzymane w pamięci przez cały czas —
-        // wczytujemy je dopiero gdy użytkownik kliknie parę.
+        // ── Wybór pary — lazy load tekstów ──────────────────────────────────
         private void ListPary_SelectedIndexChanged(object sender, EventArgs e)
         {
             int indeks = listPary.SelectedIndex;
@@ -370,12 +360,9 @@ namespace GUI
 
             WynikPary wynik = wczytaneWyniki[indeks];
 
-            lblNazwaA.Text = Path.GetFileName(wynik.plikA) +
-                             $" (A→B: {wynik.aDoB:F2}%)";
-            lblNazwaB.Text = Path.GetFileName(wynik.plikB) +
-                             $" (B→A: {wynik.bDoA:F2}%)";
+            lblNazwaA.Text = Path.GetFileName(wynik.plikA) + $" (A→B: {wynik.aDoB:F2}%)";
+            lblNazwaB.Text = Path.GetFileName(wynik.plikB) + $" (B→A: {wynik.bDoA:F2}%)";
 
-            // Wczytanie tekstu lokalnie — lazy, tylko gdy potrzebne do podglądu
             string tekstA = WczytajTekstLokalnie(wynik.plikA);
             string tekstB = WczytajTekstLokalnie(wynik.plikB);
 
@@ -386,7 +373,6 @@ namespace GUI
             PodswietlFragmenty(rtbPlikB, wynik.zakresy2);
         }
 
-        // Wczytuje tekst z dysku — fallback jeśli plik nie istnieje
         private string WczytajTekstLokalnie(string sciezka)
         {
             try
@@ -426,7 +412,7 @@ namespace GUI
             rtb.Select(0, 0);
         }
 
-        // ── Wczytywanie zapisanych wyników z folderu ─────────────────────────
+        // ── Wczytywanie wyników z folderu ────────────────────────────────────
         private void btnWczytaj_Click(object sender, EventArgs e)
         {
             FolderBrowserDialog dialog = new FolderBrowserDialog();
@@ -457,7 +443,6 @@ namespace GUI
                     string zawartosc = File.ReadAllText(plikJson);
                     WynikPary wynik = JsonConvert.DeserializeObject<WynikPary>(zawartosc);
 
-                    // Podstawowa walidacja — pomiń uszkodzone pliki
                     if (wynik == null || wynik.plikA == null || wynik.plikB == null)
                     {
                         bledy++;
@@ -483,10 +468,9 @@ namespace GUI
                 MessageBoxButtons.OK, MessageBoxIcon.Information);
         }
 
-        // ── Zapis CSV i JSON — zabezpieczony przed kolizją nazw ──────────────
-        // Stara wersja używała DateTime.Now:yyyyMMdd_HHmmss — dwa wątki
-        // uruchomione w tej samej sekundzie nadpisywały sobie pliki.
-        // Nowa wersja dodaje losowy suffix (4 znaki hex) eliminujący kolizje.
+        // ── Zapis CSV / JSON ─────────────────────────────────────────────────
+        // ZMIANA: dodano losowy 4-znakowy suffix (Guid) eliminujący kolizje nazw
+        // przy równoległym zapisie z wielu wątków w tej samej sekundzie.
         private void ZapiszCSVLokalnie(string plikA, string plikB, string csv)
         {
             try
@@ -519,7 +503,7 @@ namespace GUI
             catch { }
         }
 
-        // ── Zapis logów błędów ───────────────────────────────────────────────
+        // ── Logi błędów ──────────────────────────────────────────────────────
         private void ZapiszLog(string komunikat)
         {
             try
