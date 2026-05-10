@@ -100,8 +100,6 @@ class Server
                 var (nazwa1, tekst1) = OdbierzPlik(reader);
                 var (nazwa2, tekst2) = OdbierzPlik(reader);
 
-                Log($"Przerabiam: {nazwa1}  vs  {nazwa2}");
-
                 var stoper = System.Diagnostics.Stopwatch.StartNew();
 
                 var task1 = Task.Run(() => PobierzNgramy(nazwa1, tekst1, n));
