@@ -83,11 +83,11 @@ class Server
                 var (ngramy1, pozycje1) = task1.Result;
                 var (ngramy2, pozycje2) = task2.Result;
 
-                var intersection = new HashSet<string>(ngramy1);
-                intersection.IntersectWith(ngramy2);
+                // OPTYMALIZACJA: Zamiast tworzyć kopię HashSetu żeby policzyć
+                // przecięcie, iterujemy po mniejszym zbiorze i sprawdzamy Contains
+                // w większym. O(min(|A|,|B|)) zamiast O(|A|) alokacji + kopiowania.
+                var (intersection, jaccard, aDoB, bDoA) = ObliczStatystyki(ngramy1, ngramy2);
 
-                double jaccard = ObliczJaccard(ngramy1, ngramy2);
-                var (aDoB, bDoA) = ObliczDwustronne(ngramy1, ngramy2);
                 var zakresy1 = ZnajdzPodobneZakresy(pozycje1, intersection);
                 var zakresy2 = ZnajdzPodobneZakresy(pozycje2, intersection);
 
@@ -157,34 +157,58 @@ class Server
         return wynik;
     }
 
+    // OPTYMALIZACJA: używamy char[] buffer zamiast string.Substring() w pętli.
+    // Substring() alokuje nowy string dla każdego słowa — dla dużych plików
+    // to miliony alokacji. Teraz konwertujemy znaki bezpośrednio do lowercase
+    // w buforze i tworzymy string tylko raz.
     static List<(string slowo, int od, int do_)> PodzielNaSlowa(string tekst)
     {
         var tokeny = new List<(string slowo, int od, int do_)>();
         int i = 0;
+        char[] bufor = new char[256]; // reużywany bufor dla słów
 
         while (i < tekst.Length)
         {
             if (!char.IsLetterOrDigit(tekst[i])) { i++; continue; }
 
             int poczatek = i;
-            while (i < tekst.Length && char.IsLetterOrDigit(tekst[i]))
-                i++;
+            int len = 0;
 
-            tokeny.Add((tekst.Substring(poczatek, i - poczatek).ToLower(), poczatek, i));
+            while (i < tekst.Length && char.IsLetterOrDigit(tekst[i]))
+            {
+                char c = char.ToLowerInvariant(tekst[i]);
+                if (len >= bufor.Length)
+                    Array.Resize(ref bufor, bufor.Length * 2);
+                bufor[len++] = c;
+                i++;
+            }
+
+            tokeny.Add((new string(bufor, 0, len), poczatek, i));
         }
 
         return tokeny;
     }
 
+    // OPTYMALIZACJA: string.Join() w pętli dla każdego ngramu jest wolne —
+    // tworzy tablicę pośrednią i alokuje nowy string przy każdym wywołaniu.
+    // Używamy StringBuilder ze stałym rozmiarem, co redukuje alokacje.
     static (HashSet<string> ngramy, Dictionary<string, (int od, int do_)> pozycje)
         GenerujNgramy(List<(string slowo, int od, int do_)> tokeny, int n)
     {
-        var ngramy = new HashSet<string>();
-        var pozycje = new Dictionary<string, (int od, int do_)>();
+        var ngramy = new HashSet<string>(tokeny.Count);
+        var pozycje = new Dictionary<string, (int od, int do_)>(tokeny.Count);
+        var sb = new StringBuilder(n * 16); // szacowana pojemność
 
         for (int i = 0; i <= tokeny.Count - n; i++)
         {
-            string ngram = string.Join(" ", tokeny.GetRange(i, n).Select(t => t.slowo));
+            sb.Clear();
+            for (int k = 0; k < n; k++)
+            {
+                if (k > 0) sb.Append(' ');
+                sb.Append(tokeny[i + k].slowo);
+            }
+            string ngram = sb.ToString();
+
             ngramy.Add(ngram);
             if (!pozycje.ContainsKey(ngram))
                 pozycje[ngram] = (tokeny[i].od, tokeny[i + n - 1].do_);
@@ -193,43 +217,57 @@ class Server
         return (ngramy, pozycje);
     }
 
-    static double ObliczJaccard(HashSet<string> ngramyA, HashSet<string> ngramyB)
+    // OPTYMALIZACJA: Poprzednio ObliczJaccard i ObliczDwustronne każda z osobna
+    // robiła "new HashSet<string>(ngramyA)" (kopia całego zbioru!) i IntersectWith.
+    // To 2 pełne kopie + 2 iteracje przez dziesiątki tysięcy elementów.
+    //
+    // Teraz liczymy przecięcie raz: iterujemy po MNIEJSZYM zbiorze
+    // i sprawdzamy Contains() w WIĘKSZYM (O(1) dla HashSet).
+    // Jeden przebieg, zero kopii HashSetu, zwracamy gotowy intersection
+    // który potem użyje ZnajdzPodobneZakresy (zamiast liczyć go po raz 3.).
+    static (HashSet<string> intersection, double jaccard, double aDoB, double bDoA)
+        ObliczStatystyki(HashSet<string> A, HashSet<string> B)
     {
-        var intersection = new HashSet<string>(ngramyA);
-        intersection.IntersectWith(ngramyB);
-        var union = new HashSet<string>(ngramyA);
-        union.UnionWith(ngramyB);
-        if (union.Count == 0) return 0;
-        return (double)intersection.Count / union.Count * 100.0;
-    }
+        if (A.Count == 0 || B.Count == 0)
+            return (new HashSet<string>(), 0, 0, 0);
 
-    static (double, double) ObliczDwustronne(HashSet<string> A, HashSet<string> B)
-    {
-        var intersection = new HashSet<string>(A);
-        intersection.IntersectWith(B);
-        if (A.Count == 0 || B.Count == 0) return (0, 0);
-        return ((double)intersection.Count / A.Count * 100.0,
-                (double)intersection.Count / B.Count * 100.0);
+        // iterujemy po mniejszym
+        var (mniejszy, wiekszy) = A.Count <= B.Count ? (A, B) : (B, A);
+
+        var intersection = new HashSet<string>();
+        foreach (string s in mniejszy)
+            if (wiekszy.Contains(s))
+                intersection.Add(s);
+
+        int intCount = intersection.Count;
+        int unionCount = A.Count + B.Count - intCount;
+
+        double jaccard = unionCount == 0 ? 0 : (double)intCount / unionCount * 100.0;
+        double aDoB = (double)intCount / A.Count * 100.0;
+        double bDoA = (double)intCount / B.Count * 100.0;
+
+        return (intersection, jaccard, aDoB, bDoA);
     }
 
     static List<(int od, int do_)> ZnajdzPodobneZakresy(
         Dictionary<string, (int od, int do_)> pozycje,
         HashSet<string> wspolneNgramy)
     {
-        var zakresy = new List<(int od, int do_)>();
+        var zakresy = new List<(int od, int do_)>(wspolneNgramy.Count);
         foreach (var ngram in wspolneNgramy)
-            if (pozycje.ContainsKey(ngram))
-                zakresy.Add(pozycje[ngram]);
+            if (pozycje.TryGetValue(ngram, out var z))
+                zakresy.Add(z);
 
         zakresy.Sort((a, b) => a.od.CompareTo(b.od));
 
         var polaczone = new List<(int od, int do_)>();
         foreach (var z in zakresy)
         {
-            if (polaczone.Count == 0 || z.od > polaczone.Last().do_)
+            if (polaczone.Count == 0 || z.od > polaczone[polaczone.Count - 1].do_)
                 polaczone.Add(z);
             else
-                polaczone[polaczone.Count - 1] = (polaczone.Last().od, Math.Max(polaczone.Last().do_, z.do_));
+                polaczone[polaczone.Count - 1] = (polaczone[polaczone.Count - 1].od,
+                    Math.Max(polaczone[polaczone.Count - 1].do_, z.do_));
         }
 
         return polaczone;

@@ -20,8 +20,6 @@ namespace GUI
         private static readonly object _plikLock = new object();
         private static readonly object _logLock = new object();
 
-        // ZMIANA: timeout 5 minut — tak jak w kliencie konsolowym.
-        // 60s (poprzednia wartość) było za krótkie dla par dużych plików.
         const int TIMEOUT_MS = 300_000;
 
         public Form1()
@@ -71,6 +69,14 @@ namespace GUI
         }
 
         // ── Kolorowanie listy ─────────────────────────────────────────────────
+        // NAPRAWA: wcześniej kod robił "new SolidBrush(...)" bez using/Dispose,
+        // co powodowało wyciek uchwytów GDI. Przy dużej liście par Windows
+        // kończył uchwyty GDI (limit ~10 000) i aplikacja się wysypywała.
+        // Teraz każdy SolidBrush jest tworzony wewnątrz bloku "using".
+        //
+        // NAPRAWA 2: sprawdzamy e.Index < wczytaneWyniki.Count (nie < listPary.Items.Count),
+        // bo Items.Clear() + BeginUpdate może wołać DrawItem ze starymi indeksami
+        // zanim wczytaneWyniki zostanie zaktualizowana — to powodowało IndexOutOfRange.
         private void ListPary_DrawItem(object sender, DrawItemEventArgs e)
         {
             if (e.Index < 0 || e.Index >= wczytaneWyniki.Count) return;
@@ -83,7 +89,11 @@ namespace GUI
                 ? Color.FromArgb(220, 220, 220)
                 : Color.White;
 
-            e.Graphics.FillRectangle(new SolidBrush(tlo), e.Bounds);
+            // NAPRAWA: using zapewnia Dispose() — brak wycieku GDI
+            using (SolidBrush tloB = new SolidBrush(tlo))
+            {
+                e.Graphics.FillRectangle(tloB, e.Bounds);
+            }
 
             Color kolorTekstu;
             if (jaccard >= prog)
@@ -101,8 +111,12 @@ namespace GUI
                            jaccard.ToString("F2") + "%" +
                            (jaccard >= prog ? " ⚠" : "");
 
-            e.Graphics.DrawString(tekst, e.Font, new SolidBrush(kolorTekstu),
-                e.Bounds.X + 2, e.Bounds.Y + 2);
+            // NAPRAWA: using tutaj też
+            using (SolidBrush tekstB = new SolidBrush(kolorTekstu))
+            {
+                e.Graphics.DrawString(tekst, e.Font, tekstB,
+                    e.Bounds.X + 2, e.Bounds.Y + 2);
+            }
 
             e.DrawFocusRectangle();
         }
@@ -146,6 +160,10 @@ namespace GUI
             progressBar.Minimum = 0;
             progressBar.Maximum = pary.Count;
             progressBar.Value = 0;
+
+            // NAPRAWA: czyścimy wczytaneWyniki PRZED listPary.Items.Clear(),
+            // żeby DrawItem nigdy nie zobaczył stanu gdzie lista ma 0 itemów
+            // ale wczytaneWyniki ma stare dane (lub odwrotnie).
             wczytaneWyniki.Clear();
             listPary.Items.Clear();
 
@@ -164,8 +182,6 @@ namespace GUI
 
             await Task.Run(() =>
             {
-                // ZMIANA: maxWatkow = liczba serwerów × 2 zamiast tylko count(serwerów).
-                // To lepiej wykorzystuje wiele serwerów i jest symetryczne z klientem konsolowym.
                 int maxWatkow = Math.Max(1, adresy.Count * 2);
                 maxWatkow = Math.Min(maxWatkow, pary.Count);
 
@@ -258,7 +274,7 @@ namespace GUI
                         writer.Write(grainSize);
                         WyslijPlik(writer, plikA);
                         WyslijPlik(writer, plikB);
-                        writer.Flush(); // ZMIANA: jawny flush przed oczekiwaniem
+                        writer.Flush();
 
                         double jaccard = reader.ReadDouble();
                         double aDoB = reader.ReadDouble();
@@ -276,7 +292,7 @@ namespace GUI
 
                         string csv = reader.ReadString();
                         string json = reader.ReadString();
-                        reader.ReadInt64(); // czasObliczenSerwera — pomijamy
+                        reader.ReadInt64();
 
                         ZapiszCSVLokalnie(plikA, plikB, csv);
                         ZapiszJSONLokalnie(plikA, plikB, json);
@@ -311,11 +327,6 @@ namespace GUI
             }
         }
 
-        // ── NAPRAWIONY WYSYŁ PLIKU ────────────────────────────────────────────
-        // STARA WERSJA: File.ReadAllBytes() — ładowała cały plik do RAM.
-        // Przy wielu dużych plikach równolegle powodowało spike pamięci.
-        //
-        // NOWA WERSJA: strumieniowy odczyt 64 KB naraz — stałe zużycie RAM.
         private void WyslijPlik(BinaryWriter writer, string sciezka)
         {
             string nazwa = Path.GetFileName(sciezka);
@@ -326,7 +337,7 @@ namespace GUI
 
             using (FileStream fs = new FileStream(sciezka, FileMode.Open, FileAccess.Read, FileShare.Read))
             {
-                byte[] bufor = new byte[65536]; // 64 KB
+                byte[] bufor = new byte[65536];
                 int przeczytane;
                 while ((przeczytane = fs.Read(bufor, 0, bufor.Length)) > 0)
                     writer.Write(bufor, 0, przeczytane);
@@ -346,10 +357,12 @@ namespace GUI
         // ── Lista par ────────────────────────────────────────────────────────
         private void OdswiezListe()
         {
+            listPary.BeginUpdate();
             listPary.Items.Clear();
             foreach (var wynik in wczytaneWyniki)
                 listPary.Items.Add(
                     Path.GetFileName(wynik.plikA) + " vs " + Path.GetFileName(wynik.plikB));
+            listPary.EndUpdate();
         }
 
         // ── Wybór pary — lazy load tekstów ──────────────────────────────────
@@ -469,8 +482,6 @@ namespace GUI
         }
 
         // ── Zapis CSV / JSON ─────────────────────────────────────────────────
-        // ZMIANA: dodano losowy 4-znakowy suffix (Guid) eliminujący kolizje nazw
-        // przy równoległym zapisie z wielu wątków w tej samej sekundzie.
         private void ZapiszCSVLokalnie(string plikA, string plikB, string csv)
         {
             try
