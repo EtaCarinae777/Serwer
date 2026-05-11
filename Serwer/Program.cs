@@ -35,7 +35,7 @@ class Server
     {
         var t = new Thread(() =>
         {
-            foreach (string msg in _logQueue.GetConsumingEnumerable())
+            //foreach (string msg in _logQueue.GetConsumingEnumerable())
                 //Console.WriteLine(msg);
         });
         t.IsBackground = true;

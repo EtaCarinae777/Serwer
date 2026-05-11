@@ -205,7 +205,10 @@ namespace GUI
                     }
                 }
 
+                var swFaza1 = System.Diagnostics.Stopwatch.StartNew();
                 Task.WaitAll(uploadTasks.ToArray());
+                swFaza1.Stop();
+                ZapiszLog($"[FAZA1] Upload wszystkich plikow: {swFaza1.ElapsedMilliseconds}ms ({posortowane.Count} plikow x {adresy.Count} serwerow)");
             });
 
             if (!uploadOK)
@@ -228,6 +231,7 @@ namespace GUI
                 int maxWatkow = Math.Min(liczbaSerwerow * SLOTOW_NA_SERWER, pary.Count);
                 var opcje = new ParallelOptions { MaxDegreeOfParallelism = maxWatkow };
 
+                var swFaza2 = System.Diagnostics.Stopwatch.StartNew();
                 Parallel.ForEach(pary, opcje, (para) =>
                 {
                     int idx = (int)((uint)Interlocked.Increment(ref _licznikZadan) % liczbaSerwerow);
@@ -246,6 +250,8 @@ namespace GUI
                         lblStatus.Text = $"Faza 2/2: {Path.GetFileName(para.Item1)} vs {Path.GetFileName(para.Item2)}";
                     }));
                 });
+                swFaza2.Stop();
+                ZapiszLog($"[FAZA2] Porownywanie {pary.Count} par: {swFaza2.ElapsedMilliseconds}ms ({liczbaSerwerow} serwerow, {maxWatkow} watkow)");
             });
 
             stoper.Stop();
@@ -363,6 +369,7 @@ namespace GUI
             string plikA, string plikB,
             int n, int grainSize)
         {
+            var sw = System.Diagnostics.Stopwatch.StartNew();
             try
             {
                 using (TcpClient klient = new TcpClient())
@@ -409,6 +416,9 @@ namespace GUI
 
                         ZapiszCSVLokalnie(plikA, plikB, csv);
                         ZapiszJSONLokalnie(plikA, plikB, json);
+
+                        sw.Stop();
+                        ZapiszLog($"[CZAS] {Path.GetFileName(plikA)} vs {Path.GetFileName(plikB)} @ {adres} - connect+compare: {sw.ElapsedMilliseconds}ms");
 
                         return new WynikPary
                         {
