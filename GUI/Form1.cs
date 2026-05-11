@@ -60,6 +60,68 @@ namespace GUI
             public int do_ { get; set; }
         }
 
+        // ── Stan lazy uploadu ─────────────────────────────────────────────────
+        // fileIds[adres][sciezka] = file_id — wypełniany leniwie przy pierwszym COMPARE
+        private Dictionary<string, Dictionary<string, string>> _fileIds;
+        // Locki per (adres, sciezka) — żeby ten sam plik nie był uploadowany 2× na ten sam serwer
+        private Dictionary<string, SemaphoreSlim> _uploadLocks;
+        private static readonly object _uploadLocksLock = new object();
+
+        private SemaphoreSlim PobierzUploadLock(string adres, string sciezka)
+        {
+            string klucz = $"{adres}|{sciezka}";
+            lock (_uploadLocksLock)
+            {
+                if (!_uploadLocks.TryGetValue(klucz, out var sem))
+                {
+                    sem = new SemaphoreSlim(1, 1);
+                    _uploadLocks[klucz] = sem;
+                }
+                return sem;
+            }
+        }
+
+        // Zapewnia że plik jest na serwerze — uploaduje jeśli jeszcze nie był.
+        // Zwraca file_id lub null przy błędzie.
+        private string ZapewnijUpload(string adres, int port, string sciezka)
+        {
+            // Szybka ścieżka — już jest
+            lock (_fileIds)
+            {
+                if (_fileIds[adres].TryGetValue(sciezka, out string id))
+                    return id;
+            }
+
+            // Wolna ścieżka — upload z lockiem per (adres, sciezka)
+            var sem = PobierzUploadLock(adres, sciezka);
+            sem.Wait();
+            try
+            {
+                // Sprawdź ponownie po wejściu do locka
+                lock (_fileIds)
+                {
+                    if (_fileIds[adres].TryGetValue(sciezka, out string id))
+                        return id;
+                }
+
+                string fileId = WyslijUpload(adres, port, sciezka);
+                if (fileId == null)
+                {
+                    ZapiszLog($"[UPLOAD BLAD] {adres} - {Path.GetFileName(sciezka)}");
+                    return null;
+                }
+
+                lock (_fileIds)
+                    _fileIds[adres][sciezka] = fileId;
+
+                return fileId;
+            }
+            finally
+            {
+                sem.Release();
+            }
+        }
+
         // ── Wybor plikow ─────────────────────────────────────────────────────
         private void btnWybierzPliki_Click(object sender, EventArgs e)
         {
@@ -155,69 +217,16 @@ namespace GUI
             timerInterfejsu.Start();
             _licznikZadan = -1;
 
-            // ── FAZA 1: upload kazdego pliku raz na kazdy serwer ─────────────
-            lblStatus.Text = "Faza 1/2: Przesylanie plikow na serwery...";
-            progressBar.Minimum = 0;
-            progressBar.Maximum = posortowane.Count * adresy.Count;
-            progressBar.Value = 0;
-
-            // fileIds[adres][sciezka] = file_id zwrocony przez serwer
-            var fileIds = new Dictionary<string, Dictionary<string, string>>();
+            // Inicjalizacja stanu lazy uploadu
+            _fileIds = new Dictionary<string, Dictionary<string, string>>();
+            _uploadLocks = new Dictionary<string, SemaphoreSlim>();
             foreach (var adres in adresy)
-                fileIds[adres] = new Dictionary<string, string>();
+                _fileIds[adres] = new Dictionary<string, string>();
 
-            int uploadWykonane = 0;
-            bool uploadOK = true;
-
-            await Task.Run(() =>
-            {
-                var uploadTasks = new List<Task>();
-
-                foreach (var adres in adresy)
-                {
-                    foreach (var sciezka in posortowane)
-                    {
-                        string adresLocal = adres;
-                        string sciezkaLocal = sciezka;
-
-                        uploadTasks.Add(Task.Run(() =>
-                        {
-                            string fileId = WyslijUpload(adresLocal, port, sciezkaLocal);
-
-                            if (fileId == null)
-                            {
-                                uploadOK = false;
-                                ZapiszLog($"[UPLOAD BLAD] {adresLocal} - {Path.GetFileName(sciezkaLocal)}");
-                            }
-                            else
-                            {
-                                lock (fileIds)
-                                    fileIds[adresLocal][sciezkaLocal] = fileId;
-                            }
-
-                            int done = Interlocked.Increment(ref uploadWykonane);
-                            BeginInvoke(new Action(() =>
-                            {
-                                progressBar.Value = Math.Min(done, progressBar.Maximum);
-                                lblStatus.Text = $"Faza 1/2: Przeslano {done}/{posortowane.Count * adresy.Count} plikow...";
-                            }));
-                        }));
-                    }
-                }
-
-                var swFaza1 = System.Diagnostics.Stopwatch.StartNew();
-                Task.WaitAll(uploadTasks.ToArray());
-                swFaza1.Stop();
-                ZapiszLog($"[FAZA1] Upload wszystkich plikow: {swFaza1.ElapsedMilliseconds}ms ({posortowane.Count} plikow x {adresy.Count} serwerow)");
-            });
-
-            if (!uploadOK)
-                MessageBox.Show(
-                    "Nie udalo sie przeslac niektorych plikow na serwery.\nSprawdz errors.log.",
-                    "Blad uploadu", MessageBoxButtons.OK, MessageBoxIcon.Warning);
-
-            // ── FAZA 2: porownywanie par po file_id ──────────────────────────
-            lblStatus.Text = "Faza 2/2: Porownywanie par...";
+            // ── FAZA 1 (lazy): brak wstępnego uploadu — pliki trafią na serwery
+            //    dopiero gdy dana para zostanie przydzielona do konkretnego serwera.
+            // ── FAZA 2: porownywanie par ─────────────────────────────────────
+            lblStatus.Text = "Porownywanie par (upload lazily)...";
             progressBar.Minimum = 0;
             progressBar.Maximum = pary.Count;
             progressBar.Value = 0;
@@ -226,18 +235,19 @@ namespace GUI
             var wynikiBag = new System.Collections.Concurrent.ConcurrentBag<WynikPary>();
             int liczbaSerwerow = adresy.Count;
 
+            var swTotal = System.Diagnostics.Stopwatch.StartNew();
+
             await Task.Run(() =>
             {
                 int maxWatkow = Math.Min(liczbaSerwerow * SLOTOW_NA_SERWER, pary.Count);
                 var opcje = new ParallelOptions { MaxDegreeOfParallelism = maxWatkow };
 
-                var swFaza2 = System.Diagnostics.Stopwatch.StartNew();
                 Parallel.ForEach(pary, opcje, (para) =>
                 {
                     int idx = (int)((uint)Interlocked.Increment(ref _licznikZadan) % liczbaSerwerow);
 
                     var wynik = WyslijCompareFailover(
-                        adresy, fileIds, idx, port,
+                        adresy, idx, port,
                         para.Item1, para.Item2, n, grainSize);
 
                     if (wynik != null)
@@ -247,12 +257,22 @@ namespace GUI
                     BeginInvoke(new Action(() =>
                     {
                         progressBar.Value = Math.Min(done, pary.Count);
-                        lblStatus.Text = $"Faza 2/2: {Path.GetFileName(para.Item1)} vs {Path.GetFileName(para.Item2)}";
+                        lblStatus.Text = $"Para {done}/{pary.Count}: {Path.GetFileName(para.Item1)} vs {Path.GetFileName(para.Item2)}";
                     }));
                 });
-                swFaza2.Stop();
-                ZapiszLog($"[FAZA2] Porownywanie {pary.Count} par: {swFaza2.ElapsedMilliseconds}ms ({liczbaSerwerow} serwerow, {maxWatkow} watkow)");
             });
+
+            swTotal.Stop();
+            ZapiszLog($"[TOTAL] {pary.Count} par, {liczbaSerwerow} serwerow: {swTotal.ElapsedMilliseconds}ms");
+
+            // Statystyki uploadu
+            foreach (var adres in adresy)
+            {
+                int uploadCount;
+                lock (_fileIds)
+                    uploadCount = _fileIds[adres].Count;
+                ZapiszLog($"[UPLOAD LAZY] {adres}: przeslano {uploadCount}/{posortowane.Count} plikow");
+            }
 
             stoper.Stop();
             timerInterfejsu.Stop();
@@ -282,7 +302,7 @@ namespace GUI
             btnWybierzPliki.Enabled = true;
         }
 
-        // ── Upload pliku na serwer (faza 1) ──────────────────────────────────
+        // ── Upload pliku na serwer ────────────────────────────────────────────
         // Protokol: [0x01] [nazwa:string] [rozmiar:int64] [dane:bytes]
         // Odpowiedz: [file_id:string] [juz_w_cache:bool]
         private string WyslijUpload(string adres, int port, string sciezka)
@@ -317,6 +337,7 @@ namespace GUI
 
                         string fileId = reader.ReadString();
                         bool wCache = reader.ReadBoolean();
+                        ZapiszLog($"[UPLOAD] {Path.GetFileName(sciezka)} → {adres} ({(wCache ? "cache hit" : "nowy")})");
                         return fileId;
                     }
                 }
@@ -328,10 +349,9 @@ namespace GUI
             }
         }
 
-        // ── Compare z failoverem (faza 2) ────────────────────────────────────
+        // ── Compare z failoverem i lazy uploadem ──────────────────────────────
         private WynikPary WyslijCompareFailover(
             List<string> adresy,
-            Dictionary<string, Dictionary<string, string>> fileIds,
             int startIdx, int port,
             string plikA, string plikB, int n, int grainSize)
         {
@@ -340,11 +360,18 @@ namespace GUI
                 int aktIdx = (startIdx + i) % adresy.Count;
                 string adres = adresy[aktIdx];
 
-                if (!fileIds[adres].TryGetValue(plikA, out string idA) ||
-                    !fileIds[adres].TryGetValue(plikB, out string idB))
+                // Lazy upload — uploaduj plik tylko jeśli ten serwer jeszcze go nie ma
+                string idA = ZapewnijUpload(adres, port, plikA);
+                if (idA == null)
                 {
-                    ZapiszLog($"[FAILOVER] Serwer {adres} nie ma file_id dla pary " +
-                              $"{Path.GetFileName(plikA)} vs {Path.GetFileName(plikB)}. Probuje nastepny...");
+                    ZapiszLog($"[FAILOVER] Upload A zawiodl na {adres}, probuje nastepny serwer...");
+                    continue;
+                }
+
+                string idB = ZapewnijUpload(adres, port, plikB);
+                if (idB == null)
+                {
+                    ZapiszLog($"[FAILOVER] Upload B zawiodl na {adres}, probuje nastepny serwer...");
                     continue;
                 }
 
@@ -361,7 +388,7 @@ namespace GUI
             return null;
         }
 
-        // ── Wyslanie COMPARE (faza 2) ─────────────────────────────────────────
+        // ── Wyslanie COMPARE ──────────────────────────────────────────────────
         // Protokol: [0x02] [fileId_A:string] [fileId_B:string] [n:int32] [grainSize:int32]
         private WynikPary WyslijCompare(
             string adres, int port,
