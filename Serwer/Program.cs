@@ -1,5 +1,4 @@
 ﻿using System;
-using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
@@ -14,33 +13,24 @@ class Server
 {
     static int port = 8001;
 
-    const int MAX_CACHE_ENTRIES = 300;
+    const int MAX_CACHE_ENTRIES = 200;
 
-    // Cache współdzielony bez globalnego locka.
-    // ConcurrentDictionary znacząco zmniejsza contention
-    // przy wielu równoległych żądaniach.
-    static readonly ConcurrentDictionary<
-        string,
-        (HashSet<string> ngramy,
-         Dictionary<string, (int od, int do_)> pozycje)
-    > cache =
-        new ConcurrentDictionary<
-            string,
-            (HashSet<string>,
-             Dictionary<string, (int, int)>)
-        >();
+    // Cache n-gramów: file_id (SHA256 hex) → przetworzone dane
+    static readonly Dictionary<string, (LinkedListNode<string> node,
+        HashSet<string> ngramy, Dictionary<string, (int od, int do_)> pozycje, string nazwaPliku)> cache
+        = new Dictionary<string, (LinkedListNode<string>,
+            HashSet<string>, Dictionary<string, (int, int)>, string)>();
 
-    const int MAX_ROWNOLEGLOSCI = 4;
+    static readonly LinkedList<string> cacheKolejnosc = new LinkedList<string>();
+    static readonly object cacheLock = new object();
 
-    // zamiast stałej 8, dynamicznie
-    static readonly SemaphoreSlim semafor = new SemaphoreSlim(
-        Environment.ProcessorCount * 2,
-        Environment.ProcessorCount * 2
-    );
+    const int MAX_ROWNOLEGLOSCI = 16;
+    static readonly SemaphoreSlim semafor = new SemaphoreSlim(MAX_ROWNOLEGLOSCI, MAX_ROWNOLEGLOSCI);
 
     // Logger nieblokujący
-    static readonly BlockingCollection<string> _logQueue =
-        new BlockingCollection<string>(1024);
+    static readonly System.Collections.Concurrent.BlockingCollection<string> _logQueue
+        = new System.Collections.Concurrent.BlockingCollection<string>(1024);
+
     static Server()
     {
         var t = new Thread(() =>
@@ -57,50 +47,18 @@ class Server
         _logQueue.TryAdd($"[{DateTime.Now:HH:mm:ss}] {komunikat}");
     }
 
-    static async Task Main()
+    static void Main()
     {
         TcpListener serwer = new TcpListener(IPAddress.Any, port);
         serwer.Start();
-
         Log($"Serwer uruchomiony na porcie {port}.");
+        Log($"Protokół: UPLOAD <plik> → file_id  |  COMPARE <id_A> <id_B> <n> → wyniki");
 
         while (true)
         {
-            TcpClient klient = await serwer.AcceptTcpClientAsync();
-
-            await semafor.WaitAsync();
-
-            _ = Task.Run(() =>
-            {
-                try
-                {
-                    ObsluzKlienta(klient);
-                }
-                finally
-                {
-                    semafor.Release();
-                }
-            });
+            TcpClient klient = serwer.AcceptTcpClient();
+            Task.Run(() => ObsluzKlienta(klient));
         }
-    }
-
-    static (string nazwa, string tekst) OdbierzPlik(BinaryReader reader)
-    {
-        string nazwa = reader.ReadString();
-        long rozmiar = reader.ReadInt64();
-
-        byte[] dane = new byte[rozmiar];
-        long przeczytano = 0;
-
-        while (przeczytano < rozmiar)
-        {
-            int porcja = reader.Read(dane, (int)przeczytano, (int)Math.Min(rozmiar - przeczytano, 65536));
-            if (porcja == 0)
-                throw new EndOfStreamException();
-            przeczytano += porcja;
-        }
-
-        return (nazwa, Encoding.UTF8.GetString(dane));
     }
 
     static void ObsluzKlienta(TcpClient klient)
@@ -108,53 +66,22 @@ class Server
         klient.ReceiveTimeout = 300_000;
         klient.SendTimeout = 300_000;
 
-        //semafor.Wait();
-
+        semafor.Wait();
         try
         {
             using (NetworkStream stream = klient.GetStream())
             using (BinaryReader reader = new BinaryReader(stream))
             using (BinaryWriter writer = new BinaryWriter(stream))
             {
-                int n = reader.ReadInt32();
-                int grainSize = reader.ReadInt32();
+                // Pierwszym bajtem jest typ komendy
+                byte komenda = reader.ReadByte();
 
-                var (nazwa1, tekst1) = OdbierzPlik(reader);
-                var (nazwa2, tekst2) = OdbierzPlik(reader);
-
-                var stoper = System.Diagnostics.Stopwatch.StartNew();
-
-                var (ngramy1, pozycje1) = PobierzNgramy(nazwa1, tekst1, n);
-                var (ngramy2, pozycje2) = PobierzNgramy(nazwa2, tekst2, n);
-
-                // OPTYMALIZACJA: Zamiast tworzyć kopię HashSetu żeby policzyć
-                // przecięcie, iterujemy po mniejszym zbiorze i sprawdzamy Contains
-                // w większym. O(min(|A|,|B|)) zamiast O(|A|) alokacji + kopiowania.
-                var (intersection, jaccard, aDoB, bDoA) = ObliczStatystyki(ngramy1, ngramy2);
-
-                var zakresy1 = ZnajdzPodobneZakresy(pozycje1, intersection);
-                var zakresy2 = ZnajdzPodobneZakresy(pozycje2, intersection);
-
-                stoper.Stop();
-                long czasObliczenMs = stoper.ElapsedMilliseconds;
-
-                string csvContent = GenerujCSV(nazwa1, nazwa2, jaccard, aDoB, bDoA, zakresy1, zakresy2);
-                string jsonContent = GenerujJSON(nazwa1, nazwa2, jaccard, aDoB, bDoA, zakresy1, zakresy2);
-
-                writer.Write(jaccard);
-                writer.Write(aDoB);
-                writer.Write(bDoA);
-
-                writer.Write(zakresy1.Count);
-                foreach (var (od, do_) in zakresy1) { writer.Write(od); writer.Write(do_); }
-
-                writer.Write(zakresy2.Count);
-                foreach (var (od, do_) in zakresy2) { writer.Write(od); writer.Write(do_); }
-
-                writer.Write(csvContent);
-                writer.Write(jsonContent);
-                writer.Write(czasObliczenMs);
-                writer.Flush();
+                if (komenda == 0x01)
+                    ObsluzUpload(reader, writer);
+                else if (komenda == 0x02)
+                    ObsluzCompare(reader, writer);
+                else
+                    Log($"Nieznana komenda: 0x{komenda:X2}");
             }
         }
         catch (Exception ex)
@@ -163,38 +90,213 @@ class Server
         }
         finally
         {
-            //semafor.Release();
+            semafor.Release();
             klient.Close();
         }
     }
 
-    static (HashSet<string> ngramy,
-        Dictionary<string, (int od, int do_)> pozycje)
-    PobierzNgramy(string nazwaPliku, string tekst, int n)
+    // ── UPLOAD ───────────────────────────────────────────────────────────────
+    // Protokół: [0x01] [nazwa:string] [rozmiar:int64] [dane:bytes]
+    // Odpowiedź: [file_id:string] [juz_w_cache:bool]
+    static void ObsluzUpload(BinaryReader reader, BinaryWriter writer)
     {
-        string klucz = nazwaPliku + "_" + tekst.Length + "_n" + n;
+        string nazwa = reader.ReadString();
+        long rozmiar = reader.ReadInt64();
 
-        if (cache.TryGetValue(klucz, out var wpis))
-            return wpis;
+        byte[] dane = new byte[rozmiar];
+        long przeczytano = 0;
+        while (przeczytano < rozmiar)
+        {
+            int porcja = reader.Read(dane, (int)przeczytano,
+                (int)Math.Min(rozmiar - przeczytano, 65536));
+            if (porcja == 0) throw new EndOfStreamException();
+            przeczytano += porcja;
+        }
+
+        // file_id = SHA256 zawartości — niezależny od nazwy pliku
+        string fileId = ObliczSHA256(dane);
+
+        lock (cacheLock)
+        {
+            if (cache.ContainsKey(fileId))
+            {
+                // Już w cache — aktualizuj LRU i wróć
+                var wpis = cache[fileId];
+                cacheKolejnosc.Remove(wpis.node);
+                cacheKolejnosc.AddLast(wpis.node);
+
+                writer.Write(fileId);
+                writer.Write(true); // juz_w_cache
+                writer.Flush();
+                Log($"UPLOAD (cache hit): {nazwa} → {fileId[..8]}...");
+                return;
+            }
+        }
+
+        // Oblicz n-gramy poza lockiem (może być wolne dla dużych plików)
+        string tekst = Encoding.UTF8.GetString(dane);
+        var tokeny = PodzielNaSlowa(tekst);
+
+        // Zapisujemy tokeny — n będzie podane przy COMPARE
+        // Żeby nie liczyć n-gramów dla każdego n osobno przy uploadzie,
+        // przechowujemy tokeny i liczymy lazily. Jednak dla uproszczenia
+        // trzymamy dane surowe i przeliczamy przy pierwszym COMPARE.
+        // Cache per (fileId, n) jest obsługiwany w ObsluzCompare.
+
+        lock (cacheLock)
+        {
+            if (!cache.ContainsKey(fileId))
+            {
+                if (cache.Count >= MAX_CACHE_ENTRIES)
+                {
+                    string najstarszy = cacheKolejnosc.First.Value;
+                    cacheKolejnosc.RemoveFirst();
+                    cache.Remove(najstarszy);
+                }
+                // Tymczasowo zapisujemy z pustymi n-gramami (n nieznane przy uploadzie)
+                var node = cacheKolejnosc.AddLast(fileId);
+                cache[fileId] = (node, null, null, nazwa);
+            }
+        }
+
+        // Zapisz surowy tekst do tymczasowego store'u
+        lock (tekstyLock)
+        {
+            if (!tekstySurowe.ContainsKey(fileId))
+                tekstySurowe[fileId] = tekst;
+        }
+
+        writer.Write(fileId);
+        writer.Write(false); // nie było w cache
+        writer.Flush();
+        Log($"UPLOAD: {nazwa} ({rozmiar / 1024.0:F1} KB) → {fileId[..8]}...");
+    }
+
+    // Surowe teksty (potrzebne do obliczenia n-gramów przy COMPARE)
+    static readonly Dictionary<string, string> tekstySurowe = new Dictionary<string, string>();
+    static readonly object tekstyLock = new object();
+
+    // Cache n-gramów per (fileId, n) — klucz: "fileId_n3" itd.
+    static readonly Dictionary<string, (HashSet<string> ngramy,
+        Dictionary<string, (int od, int do_)> pozycje)> ngramCache
+        = new Dictionary<string, (HashSet<string>, Dictionary<string, (int, int)>)>();
+    static readonly object ngramCacheLock = new object();
+
+    // ── COMPARE ──────────────────────────────────────────────────────────────
+    // Protokół: [0x02] [fileId_A:string] [fileId_B:string] [n:int32] [grainSize:int32]
+    // Odpowiedź: [jaccard:double] [aDoB:double] [bDoA:double]
+    //            [count1:int32] [od:int32 do:int32]×count1
+    //            [count2:int32] [od:int32 do:int32]×count2
+    //            [csv:string] [json:string] [czasMs:int64]
+    static void ObsluzCompare(BinaryReader reader, BinaryWriter writer)
+    {
+        string fileIdA = reader.ReadString();
+        string fileIdB = reader.ReadString();
+        int n = reader.ReadInt32();
+        int grainSize = reader.ReadInt32();
+
+        string nazwaA, nazwaB;
+        lock (cacheLock)
+        {
+            if (!cache.ContainsKey(fileIdA))
+            {
+                writer.Write(-1.0); // sygnał błędu: plik nieznany
+                writer.Flush();
+                Log($"COMPARE błąd: nieznany file_id {fileIdA[..8]}...");
+                return;
+            }
+            if (!cache.ContainsKey(fileIdB))
+            {
+                writer.Write(-1.0);
+                writer.Flush();
+                Log($"COMPARE błąd: nieznany file_id {fileIdB[..8]}...");
+                return;
+            }
+            nazwaA = cache[fileIdA].nazwaPliku;
+            nazwaB = cache[fileIdB].nazwaPliku;
+        }
+
+        var stoper = System.Diagnostics.Stopwatch.StartNew();
+
+        var task1 = Task.Run(() => PobierzNgramy(fileIdA, n));
+        var task2 = Task.Run(() => PobierzNgramy(fileIdB, n));
+        Task.WaitAll(task1, task2);
+
+        var (ngramy1, pozycje1) = task1.Result;
+        var (ngramy2, pozycje2) = task2.Result;
+
+        var (intersection, jaccard, aDoB, bDoA) = ObliczStatystyki(ngramy1, ngramy2);
+        var zakresy1 = ZnajdzPodobneZakresy(pozycje1, intersection);
+        var zakresy2 = ZnajdzPodobneZakresy(pozycje2, intersection);
+
+        stoper.Stop();
+
+        string csvContent = GenerujCSV(nazwaA, nazwaB, jaccard, aDoB, bDoA, zakresy1, zakresy2);
+        string jsonContent = GenerujJSON(nazwaA, nazwaB, jaccard, aDoB, bDoA, zakresy1, zakresy2);
+
+        writer.Write(jaccard);
+        writer.Write(aDoB);
+        writer.Write(bDoA);
+
+        writer.Write(zakresy1.Count);
+        foreach (var (od, do_) in zakresy1) { writer.Write(od); writer.Write(do_); }
+
+        writer.Write(zakresy2.Count);
+        foreach (var (od, do_) in zakresy2) { writer.Write(od); writer.Write(do_); }
+
+        writer.Write(csvContent);
+        writer.Write(jsonContent);
+        writer.Write(stoper.ElapsedMilliseconds);
+        writer.Flush();
+
+        Log($"COMPARE: {nazwaA} vs {nazwaB} (n={n}) → Jaccard={jaccard:F2}% [{stoper.ElapsedMilliseconds}ms]");
+    }
+
+    // ── N-gramy (lazy, per fileId+n) ─────────────────────────────────────────
+    static (HashSet<string> ngramy, Dictionary<string, (int od, int do_)> pozycje)
+        PobierzNgramy(string fileId, int n)
+    {
+        string klucz = $"{fileId}_n{n}";
+
+        lock (ngramCacheLock)
+        {
+            if (ngramCache.TryGetValue(klucz, out var wpis))
+                return wpis;
+        }
+
+        string tekst;
+        lock (tekstyLock)
+        {
+            if (!tekstySurowe.TryGetValue(fileId, out tekst))
+                throw new InvalidOperationException($"Brak tekstu dla fileId={fileId[..8]}...");
+        }
 
         var tokeny = PodzielNaSlowa(tekst);
         var wynik = GenerujNgramy(tokeny, n);
 
-        if (cache.Count < MAX_CACHE_ENTRIES)
-            cache.TryAdd(klucz, wynik);
+        lock (ngramCacheLock)
+        {
+            if (!ngramCache.ContainsKey(klucz))
+                ngramCache[klucz] = wynik;
+        }
 
         return wynik;
     }
 
-    // OPTYMALIZACJA: używamy char[] buffer zamiast string.Substring() w pętli.
-    // Substring() alokuje nowy string dla każdego słowa — dla dużych plików
-    // to miliony alokacji. Teraz konwertujemy znaki bezpośrednio do lowercase
-    // w buforze i tworzymy string tylko raz.
+    // ── SHA256 ────────────────────────────────────────────────────────────────
+    static string ObliczSHA256(byte[] dane)
+    {
+        using var sha = System.Security.Cryptography.SHA256.Create();
+        byte[] hash = sha.ComputeHash(dane);
+        return BitConverter.ToString(hash).Replace("-", "").ToLowerInvariant();
+    }
+
+    // ── Tokenizacja ───────────────────────────────────────────────────────────
     static List<(string slowo, int od, int do_)> PodzielNaSlowa(string tekst)
     {
         var tokeny = new List<(string slowo, int od, int do_)>();
         int i = 0;
-        char[] bufor = new char[256]; // reużywany bufor dla słów
+        char[] bufor = new char[256];
 
         while (i < tekst.Length)
         {
@@ -218,15 +320,12 @@ class Server
         return tokeny;
     }
 
-    // OPTYMALIZACJA: string.Join() w pętli dla każdego ngramu jest wolne —
-    // tworzy tablicę pośrednią i alokuje nowy string przy każdym wywołaniu.
-    // Używamy StringBuilder ze stałym rozmiarem, co redukuje alokacje.
     static (HashSet<string> ngramy, Dictionary<string, (int od, int do_)> pozycje)
         GenerujNgramy(List<(string slowo, int od, int do_)> tokeny, int n)
     {
         var ngramy = new HashSet<string>(tokeny.Count);
         var pozycje = new Dictionary<string, (int od, int do_)>(tokeny.Count);
-        var sb = new StringBuilder(n * 16); // szacowana pojemność
+        var sb = new StringBuilder(n * 16);
 
         for (int i = 0; i <= tokeny.Count - n; i++)
         {
@@ -246,21 +345,12 @@ class Server
         return (ngramy, pozycje);
     }
 
-    // OPTYMALIZACJA: Poprzednio ObliczJaccard i ObliczDwustronne każda z osobna
-    // robiła "new HashSet<string>(ngramyA)" (kopia całego zbioru!) i IntersectWith.
-    // To 2 pełne kopie + 2 iteracje przez dziesiątki tysięcy elementów.
-    //
-    // Teraz liczymy przecięcie raz: iterujemy po MNIEJSZYM zbiorze
-    // i sprawdzamy Contains() w WIĘKSZYM (O(1) dla HashSet).
-    // Jeden przebieg, zero kopii HashSetu, zwracamy gotowy intersection
-    // który potem użyje ZnajdzPodobneZakresy (zamiast liczyć go po raz 3.).
     static (HashSet<string> intersection, double jaccard, double aDoB, double bDoA)
         ObliczStatystyki(HashSet<string> A, HashSet<string> B)
     {
         if (A.Count == 0 || B.Count == 0)
             return (new HashSet<string>(), 0, 0, 0);
 
-        // iterujemy po mniejszym
         var (mniejszy, wiekszy) = A.Count <= B.Count ? (A, B) : (B, A);
 
         var intersection = new HashSet<string>();
