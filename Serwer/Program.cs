@@ -1,4 +1,5 @@
 ﻿using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
@@ -13,26 +14,33 @@ class Server
 {
     static int port = 8001;
 
-    const int MAX_CACHE_ENTRIES = 30;
+    const int MAX_CACHE_ENTRIES = 300;
 
-    // LRU cache: trzymamy LinkedListNode bezpośrednio w słowniku,
-    // dzięki czemu Remove() jest O(1) zamiast O(n).
-    static readonly Dictionary<string, (LinkedListNode<string> node,
-        HashSet<string> ngramy, Dictionary<string, (int od, int do_)> pozycje)> cache
-        = new Dictionary<string, (LinkedListNode<string>,
-            HashSet<string>, Dictionary<string, (int, int)>)>();
+    // Cache współdzielony bez globalnego locka.
+    // ConcurrentDictionary znacząco zmniejsza contention
+    // przy wielu równoległych żądaniach.
+    static readonly ConcurrentDictionary<
+        string,
+        (HashSet<string> ngramy,
+         Dictionary<string, (int od, int do_)> pozycje)
+    > cache =
+        new ConcurrentDictionary<
+            string,
+            (HashSet<string>,
+             Dictionary<string, (int, int)>)
+        >();
 
-    static readonly LinkedList<string> cacheKolejnosc = new LinkedList<string>();
-    static readonly object cacheLock = new object();
+    const int MAX_ROWNOLEGLOSCI = 4;
 
-    const int MAX_ROWNOLEGLOSCI = 8;
-    static readonly SemaphoreSlim semafor = new SemaphoreSlim(MAX_ROWNOLEGLOSCI, MAX_ROWNOLEGLOSCI);
+    // zamiast stałej 8, dynamicznie
+    static readonly SemaphoreSlim semafor = new SemaphoreSlim(
+        Environment.ProcessorCount * 2,
+        Environment.ProcessorCount * 2
+    );
 
-    // Logger nieblokujący: wątki robocze wrzucają string do kolejki (O(1)),
-    // dedykowany wątek tła wypisuje na konsolę — nikt nie czeka na Console.WriteLine.
-    static readonly System.Collections.Concurrent.BlockingCollection<string> _logQueue
-        = new System.Collections.Concurrent.BlockingCollection<string>(1024);
-
+    // Logger nieblokujący
+    static readonly BlockingCollection<string> _logQueue =
+        new BlockingCollection<string>(1024);
     static Server()
     {
         var t = new Thread(() =>
@@ -49,16 +57,30 @@ class Server
         _logQueue.TryAdd($"[{DateTime.Now:HH:mm:ss}] {komunikat}");
     }
 
-    static void Main()
+    static async Task Main()
     {
         TcpListener serwer = new TcpListener(IPAddress.Any, port);
         serwer.Start();
+
         Log($"Serwer uruchomiony na porcie {port}.");
 
         while (true)
         {
-            TcpClient klient = serwer.AcceptTcpClient();
-            Task.Run(() => ObsluzKlienta(klient));
+            TcpClient klient = await serwer.AcceptTcpClientAsync();
+
+            await semafor.WaitAsync();
+
+            _ = Task.Run(() =>
+            {
+                try
+                {
+                    ObsluzKlienta(klient);
+                }
+                finally
+                {
+                    semafor.Release();
+                }
+            });
         }
     }
 
@@ -86,7 +108,7 @@ class Server
         klient.ReceiveTimeout = 300_000;
         klient.SendTimeout = 300_000;
 
-        semafor.Wait();
+        //semafor.Wait();
 
         try
         {
@@ -102,12 +124,8 @@ class Server
 
                 var stoper = System.Diagnostics.Stopwatch.StartNew();
 
-                var task1 = Task.Run(() => PobierzNgramy(nazwa1, tekst1, n));
-                var task2 = Task.Run(() => PobierzNgramy(nazwa2, tekst2, n));
-                Task.WaitAll(task1, task2);
-
-                var (ngramy1, pozycje1) = task1.Result;
-                var (ngramy2, pozycje2) = task2.Result;
+                var (ngramy1, pozycje1) = PobierzNgramy(nazwa1, tekst1, n);
+                var (ngramy2, pozycje2) = PobierzNgramy(nazwa2, tekst2, n);
 
                 // OPTYMALIZACJA: Zamiast tworzyć kopię HashSetu żeby policzyć
                 // przecięcie, iterujemy po mniejszym zbiorze i sprawdzamy Contains
@@ -145,44 +163,25 @@ class Server
         }
         finally
         {
-            semafor.Release();
+            //semafor.Release();
             klient.Close();
         }
     }
 
-    static (HashSet<string> ngramy, Dictionary<string, (int od, int do_)> pozycje)
-        PobierzNgramy(string nazwaPliku, string tekst, int n)
+    static (HashSet<string> ngramy,
+        Dictionary<string, (int od, int do_)> pozycje)
+    PobierzNgramy(string nazwaPliku, string tekst, int n)
     {
         string klucz = nazwaPliku + "_" + tekst.Length + "_n" + n;
 
-        lock (cacheLock)
-        {
-            if (cache.TryGetValue(klucz, out var wpis))
-            {
-                // O(1) — mamy węzeł bezpośrednio, nie szukamy po liście
-                cacheKolejnosc.Remove(wpis.node);
-                cacheKolejnosc.AddLast(wpis.node);
-                return (wpis.ngramy, wpis.pozycje);
-            }
-        }
+        if (cache.TryGetValue(klucz, out var wpis))
+            return wpis;
 
         var tokeny = PodzielNaSlowa(tekst);
         var wynik = GenerujNgramy(tokeny, n);
 
-        lock (cacheLock)
-        {
-            if (!cache.ContainsKey(klucz))
-            {
-                if (cache.Count >= MAX_CACHE_ENTRIES)
-                {
-                    string najstarszy = cacheKolejnosc.First.Value;
-                    cacheKolejnosc.RemoveFirst();
-                    cache.Remove(najstarszy);
-                }
-                var node = cacheKolejnosc.AddLast(klucz);
-                cache[klucz] = (node, wynik.ngramy, wynik.pozycje);
-            }
-        }
+        if (cache.Count < MAX_CACHE_ENTRIES)
+            cache.TryAdd(klucz, wynik);
 
         return wynik;
     }

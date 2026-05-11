@@ -27,7 +27,7 @@ namespace GUI
         private const int SLOTOW_NA_SERWER = 8;
 
         // ── ZMIANA 2: licznik do równomiernego round-robin ────────────────────
-        private int _licznikZadan = -1;
+        //private int _licznikZadan = -1;
 
         const int TIMEOUT_MS = 300_000;
 
@@ -114,6 +114,16 @@ namespace GUI
 
             e.DrawFocusRectangle();
         }
+        static int StableHash(string s)
+        {
+            unchecked
+            {
+                int h = 23;
+                foreach (char c in s)
+                    h = h * 31 + c;
+                return h;
+            }
+        }
 
         // ── Główna analiza ───────────────────────────────────────────────────
         private async void btnAnalyzuj_Click(object sender, EventArgs e)
@@ -162,7 +172,7 @@ namespace GUI
             timerInterfejsu.Start();
 
             // ── ZMIANA 3: reset licznika przed każdą analizą ─────────────────
-            _licznikZadan = -1;
+            //_licznikZadan = -1;
 
             int wykonane = 0;
             var wynikiBag = new System.Collections.Concurrent.ConcurrentBag<WynikPary>();
@@ -176,23 +186,18 @@ namespace GUI
 
             int liczbaSerwerow = adresy.Count;
 
+
+
             await Task.Run(() =>
             {
-                // ── ZMIANA 4: tyle wątków ile łącznych slotów na wszystkich serwerach ──
-                // Każdy serwer ma SLOTOW_NA_SERWER równoległych zadań — tworzymy
-                // dokładnie tyle wątków GUI żeby nasycić każdy serwer w pełni.
-                // Przy 1 serwerze: 1×8 = 8 wątków (bez zmiany względem serwera).
-                // Przy 3 serwerach: 3×8 = 24 wątki → każdy serwer dostaje ~8 zadań.
-                int maxWatkow = Math.Min(liczbaSerwerow * SLOTOW_NA_SERWER, pary.Count);
-
+                //MAX WĄTKOW TU SIE ZMIENIA
+                int maxWatkow = Math.Min(10, pary.Count);
                 var opcje = new ParallelOptions { MaxDegreeOfParallelism = maxWatkow };
 
                 Parallel.ForEach(pary, opcje, (para) =>
                 {
-                    // ── ZMIANA 5: atomowy round-robin zamiast indeks % adresy.Count ──
-                    // Interlocked.Increment gwarantuje że każdy wątek dostaje
-                    // unikalny, sekwencyjny numer → równomierne rozłożenie zadań.
-                    int idx = (int)((uint)Interlocked.Increment(ref _licznikZadan) % liczbaSerwerow);
+
+                    int idx = Math.Abs(StableHash(para.Item1)) % liczbaSerwerow;
 
                     var wynik = WyslijZadanieFailover(
                         adresy, idx, port, para.Item1, para.Item2, n, grainSize);
@@ -266,6 +271,7 @@ namespace GUI
             {
                 using (TcpClient klient = new TcpClient())
                 {
+                    klient.NoDelay = true;
                     klient.ReceiveTimeout = TIMEOUT_MS;
                     klient.SendTimeout = TIMEOUT_MS;
                     klient.Connect(adres, port);
@@ -540,5 +546,7 @@ namespace GUI
             }
             catch { }
         }
+
     }
+
 }
