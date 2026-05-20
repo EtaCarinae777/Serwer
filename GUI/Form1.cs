@@ -28,6 +28,11 @@ namespace GUI
         private int _licznikZadan = -1;
         const int TIMEOUT_MS = 300_000;
 
+        [System.Runtime.InteropServices.DllImport("user32.dll")]
+        static extern IntPtr SendMessage(IntPtr hWnd, int wMsg, bool wParam, int lParam);
+        const int WM_SETREDRAW = 11;
+
+
         public Form1()
         {
             InitializeComponent();
@@ -479,17 +484,31 @@ namespace GUI
 
             WynikPary wynik = wczytaneWyniki[indeks];
 
-            lblNazwaA.Text = Path.GetFileName(wynik.plikA) + $" (A-B: {wynik.aDoB:F2}%)";
-            lblNazwaB.Text = Path.GetFileName(wynik.plikB) + $" (B-A: {wynik.bDoA:F2}%)";
+            lblNazwaA.Text = Path.GetFileName(wynik.plikA) + $" (A→B: {wynik.aDoB:F2}%)";
+            lblNazwaB.Text = Path.GetFileName(wynik.plikB) + $" (B→A: {wynik.bDoA:F2}%)";
 
-            string tekstA = WczytajTekstLokalnie(wynik.plikA);
-            string tekstB = WczytajTekstLokalnie(wynik.plikB);
+            rtbPlikA.Text = "Wczytywanie...";
+            rtbPlikB.Text = "Wczytywanie...";
 
-            rtbPlikA.Text = tekstA;
-            rtbPlikB.Text = tekstB;
+            string sciezkaA = wynik.plikA;
+            string sciezkaB = wynik.plikB;
+            var zakresy1 = wynik.zakresy1;
+            var zakresy2 = wynik.zakresy2;
 
-            PodswietlFragmenty(rtbPlikA, wynik.zakresy1);
-            PodswietlFragmenty(rtbPlikB, wynik.zakresy2);
+            Task.Run(() =>
+            {
+                string tekstA = WczytajTekstLokalnie(sciezkaA);
+                string tekstB = WczytajTekstLokalnie(sciezkaB);
+
+                this.Invoke((Action)(() =>
+                {
+                    rtbPlikA.Text = tekstA;
+                    rtbPlikB.Text = tekstB;
+                    // NA RAZIE BEZ PODSWIETLANIA
+                    PodswietlFragmenty(rtbPlikA, zakresy1);
+                    PodswietlFragmenty(rtbPlikB, zakresy2);
+                }));
+            });
         }
 
         private string WczytajTekstLokalnie(string sciezka)
@@ -509,7 +528,9 @@ namespace GUI
         // ── Podswietlanie ────────────────────────────────────────────────────
         private void PodswietlFragmenty(RichTextBox rtb, List<Zakres> zakresy)
         {
-            rtb.Visible = false;
+            // zatrzymujemy rysowanie na poziomie systemu Windows
+            SendMessage(rtb.Handle, WM_SETREDRAW, false, 0);
+
             try
             {
                 rtb.SelectAll();
@@ -536,7 +557,9 @@ namespace GUI
             }
             finally
             {
-                rtb.Visible = true;
+                // wznawiamy rysowanie i wymuszamy jedno odswiezenie
+                SendMessage(rtb.Handle, WM_SETREDRAW, true, 0);
+                rtb.Invalidate();
             }
         }
 
