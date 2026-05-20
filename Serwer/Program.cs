@@ -25,6 +25,7 @@ class Server
     static readonly object cacheLock = new object();
 
     const int MAX_ROWNOLEGLOSCI = 16;
+
     static readonly SemaphoreSlim semafor = new SemaphoreSlim(MAX_ROWNOLEGLOSCI, MAX_ROWNOLEGLOSCI);
 
     // Logger nieblokujący
@@ -38,6 +39,7 @@ class Server
             //foreach (string msg in _logQueue.GetConsumingEnumerable())
                 //Console.WriteLine(msg);
         });
+
         t.IsBackground = true;
         t.Start();
     }
@@ -50,6 +52,7 @@ class Server
     static void Main()
     {
         TcpListener serwer = new TcpListener(IPAddress.Any, port);
+
         serwer.Start();
         Log($"Serwer uruchomiony na porcie {port}.");
         Log($"Protokół: UPLOAD <plik> → file_id  |  COMPARE <id_A> <id_B> <n> → wyniki");
@@ -57,6 +60,7 @@ class Server
         while (true)
         {
             TcpClient klient = serwer.AcceptTcpClient();
+
             Task.Run(() => ObsluzKlienta(klient));
         }
     }
@@ -64,6 +68,7 @@ class Server
     static void ObsluzKlienta(TcpClient klient)
     {
         klient.ReceiveTimeout = 300_000;
+
         klient.SendTimeout = 300_000;
 
         semafor.Wait();
@@ -78,19 +83,24 @@ class Server
 
                 if (komenda == 0x01)
                     ObsluzUpload(reader, writer);
+
                 else if (komenda == 0x02)
                     ObsluzCompare(reader, writer);
+
                 else
                     Log($"Nieznana komenda: 0x{komenda:X2}");
+
             }
         }
         catch (Exception ex)
         {
             Log($"BŁĄD: {ex.GetType().Name} — {ex.Message}");
+
         }
         finally
         {
             semafor.Release();
+
             klient.Close();
         }
     }
@@ -101,16 +111,20 @@ class Server
     static void ObsluzUpload(BinaryReader reader, BinaryWriter writer)
     {
         string nazwa = reader.ReadString();
+
         long rozmiar = reader.ReadInt64();
 
         byte[] dane = new byte[rozmiar];
         long przeczytano = 0;
+
         while (przeczytano < rozmiar)
         {
             int porcja = reader.Read(dane, (int)przeczytano,
                 (int)Math.Min(rozmiar - przeczytano, 65536));
+
             if (porcja == 0) throw new EndOfStreamException();
             przeczytano += porcja;
+
         }
 
         // file_id = SHA256 zawartości — niezależny od nazwy pliku
@@ -122,12 +136,14 @@ class Server
             {
                 // Już w cache — aktualizuj LRU i wróć
                 var wpis = cache[fileId];
+
                 cacheKolejnosc.Remove(wpis.node);
                 cacheKolejnosc.AddLast(wpis.node);
 
                 writer.Write(fileId);
                 writer.Write(true); // juz_w_cache
                 writer.Flush();
+
                 Log($"UPLOAD (cache hit): {nazwa} → {fileId[..8]}...");
                 return;
             }
@@ -135,12 +151,16 @@ class Server
 
         // Oblicz n-gramy poza lockiem (może być wolne dla dużych plików)
         string tekst = Encoding.UTF8.GetString(dane);
+
         var tokeny = PodzielNaSlowa(tekst);
 
         // Zapisujemy tokeny — n będzie podane przy COMPARE
         // Żeby nie liczyć n-gramów dla każdego n osobno przy uploadzie,
-        // przechowujemy tokeny i liczymy lazily. Jednak dla uproszczenia
+        // przechowujemy tokeny i liczymy lazily.
+
+        // Jednak dla uproszczenia
         // trzymamy dane surowe i przeliczamy przy pierwszym COMPARE.
+
         // Cache per (fileId, n) jest obsługiwany w ObsluzCompare.
 
         lock (cacheLock)
@@ -155,6 +175,7 @@ class Server
                 }
                 // Tymczasowo zapisujemy z pustymi n-gramami (n nieznane przy uploadzie)
                 var node = cacheKolejnosc.AddLast(fileId);
+
                 cache[fileId] = (node, null, null, nazwa);
             }
         }
@@ -164,22 +185,29 @@ class Server
         {
             if (!tekstySurowe.ContainsKey(fileId))
                 tekstySurowe[fileId] = tekst;
+
         }
 
         writer.Write(fileId);
-        writer.Write(false); // nie było w cache
+        writer.Write(false);
+
+        // nie było w cache
         writer.Flush();
+
         Log($"UPLOAD: {nazwa} ({rozmiar / 1024.0:F1} KB) → {fileId[..8]}...");
     }
 
     // Surowe teksty (potrzebne do obliczenia n-gramów przy COMPARE)
     static readonly Dictionary<string, string> tekstySurowe = new Dictionary<string, string>();
+
     static readonly object tekstyLock = new object();
 
     // Cache n-gramów per (fileId, n) — klucz: "fileId_n3" itd.
+
     static readonly Dictionary<string, (HashSet<string> ngramy,
         Dictionary<string, (int od, int do_)> pozycje)> ngramCache
         = new Dictionary<string, (HashSet<string>, Dictionary<string, (int, int)>)>();
+
     static readonly object ngramCacheLock = new object();
 
     // ── COMPARE ──────────────────────────────────────────────────────────────
@@ -200,19 +228,24 @@ class Server
         {
             if (!cache.ContainsKey(fileIdA))
             {
-                writer.Write(-1.0); // sygnał błędu: plik nieznany
+                writer.Write(-1.0);
+
+                // sygnał błędu: plik nieznany
                 writer.Flush();
+
                 Log($"COMPARE błąd: nieznany file_id {fileIdA[..8]}...");
                 return;
             }
             if (!cache.ContainsKey(fileIdB))
             {
                 writer.Write(-1.0);
+
                 writer.Flush();
                 Log($"COMPARE błąd: nieznany file_id {fileIdB[..8]}...");
                 return;
             }
             nazwaA = cache[fileIdA].nazwaPliku;
+
             nazwaB = cache[fileIdB].nazwaPliku;
         }
 
@@ -226,6 +259,7 @@ class Server
         var (ngramy2, pozycje2) = task2.Result;
 
         var (intersection, jaccard, aDoB, bDoA) = ObliczStatystyki(ngramy1, ngramy2);
+
         var zakresy1 = ZnajdzPodobneZakresy(pozycje1, intersection);
         var zakresy2 = ZnajdzPodobneZakresy(pozycje2, intersection);
 
@@ -250,11 +284,11 @@ class Server
         writer.Flush();
 
         Log($"COMPARE: {nazwaA} vs {nazwaB} (n={n}) → Jaccard={jaccard:F2}% [{stoper.ElapsedMilliseconds}ms]");
+
     }
 
     // ── N-gramy (lazy, per fileId+n) ─────────────────────────────────────────
-    static (HashSet<string> ngramy, Dictionary<string, (int od, int do_)> pozycje)
-        PobierzNgramy(string fileId, int n)
+    static (HashSet<string> ngramy, Dictionary<string, (int od, int do_)> pozycje) PobierzNgramy(string fileId, int n)
     {
         string klucz = $"{fileId}_n{n}";
 
@@ -262,13 +296,16 @@ class Server
         {
             if (ngramCache.TryGetValue(klucz, out var wpis))
                 return wpis;
+
         }
 
         string tekst;
+
         lock (tekstyLock)
         {
             if (!tekstySurowe.TryGetValue(fileId, out tekst))
                 throw new InvalidOperationException($"Brak tekstu dla fileId={fileId[..8]}...");
+
         }
 
         var tokeny = PodzielNaSlowa(tekst);
@@ -278,15 +315,18 @@ class Server
         {
             if (!ngramCache.ContainsKey(klucz))
                 ngramCache[klucz] = wynik;
+
         }
 
         return wynik;
+
     }
 
     // ── SHA256 ────────────────────────────────────────────────────────────────
     static string ObliczSHA256(byte[] dane)
     {
         using var sha = System.Security.Cryptography.SHA256.Create();
+
         byte[] hash = sha.ComputeHash(dane);
         return BitConverter.ToString(hash).Replace("-", "").ToLowerInvariant();
     }
@@ -295,6 +335,7 @@ class Server
     static List<(string slowo, int od, int do_)> PodzielNaSlowa(string tekst)
     {
         var tokeny = new List<(string slowo, int od, int do_)>();
+
         int i = 0;
         char[] bufor = new char[256];
 
@@ -308,8 +349,10 @@ class Server
             while (i < tekst.Length && char.IsLetterOrDigit(tekst[i]))
             {
                 char c = char.ToLowerInvariant(tekst[i]);
+
                 if (len >= bufor.Length)
                     Array.Resize(ref bufor, bufor.Length * 2);
+
                 bufor[len++] = c;
                 i++;
             }
@@ -324,25 +367,31 @@ class Server
         GenerujNgramy(List<(string slowo, int od, int do_)> tokeny, int n)
     {
         var ngramy = new HashSet<string>(tokeny.Count);
+
         var pozycje = new Dictionary<string, (int od, int do_)>(tokeny.Count);
         var sb = new StringBuilder(n * 16);
 
         for (int i = 0; i <= tokeny.Count - n; i++)
         {
             sb.Clear();
+
             for (int k = 0; k < n; k++)
             {
                 if (k > 0) sb.Append(' ');
+
                 sb.Append(tokeny[i + k].slowo);
             }
             string ngram = sb.ToString();
 
             ngramy.Add(ngram);
+
             if (!pozycje.ContainsKey(ngram))
                 pozycje[ngram] = (tokeny[i].od, tokeny[i + n - 1].do_);
+
         }
 
         return (ngramy, pozycje);
+
     }
 
     static (HashSet<string> intersection, double jaccard, double aDoB, double bDoA)
@@ -354,6 +403,7 @@ class Server
         var (mniejszy, wiekszy) = A.Count <= B.Count ? (A, B) : (B, A);
 
         var intersection = new HashSet<string>();
+
         foreach (string s in mniejszy)
             if (wiekszy.Contains(s))
                 intersection.Add(s);
@@ -363,9 +413,11 @@ class Server
 
         double jaccard = unionCount == 0 ? 0 : (double)intCount / unionCount * 100.0;
         double aDoB = (double)intCount / A.Count * 100.0;
+
         double bDoA = (double)intCount / B.Count * 100.0;
 
         return (intersection, jaccard, aDoB, bDoA);
+
     }
 
     static List<(int od, int do_)> ZnajdzPodobneZakresy(
@@ -373,6 +425,7 @@ class Server
         HashSet<string> wspolneNgramy)
     {
         var zakresy = new List<(int od, int do_)>(wspolneNgramy.Count);
+
         foreach (var ngram in wspolneNgramy)
             if (pozycje.TryGetValue(ngram, out var z))
                 zakresy.Add(z);
@@ -380,16 +433,19 @@ class Server
         zakresy.Sort((a, b) => a.od.CompareTo(b.od));
 
         var polaczone = new List<(int od, int do_)>();
+
         foreach (var z in zakresy)
         {
             if (polaczone.Count == 0 || z.od > polaczone[polaczone.Count - 1].do_)
                 polaczone.Add(z);
+
             else
                 polaczone[polaczone.Count - 1] = (polaczone[polaczone.Count - 1].od,
                     Math.Max(polaczone[polaczone.Count - 1].do_, z.do_));
         }
 
         return polaczone;
+
     }
 
     static string GenerujCSV(
@@ -398,16 +454,19 @@ class Server
         List<(int od, int do_)> zakresy1, List<(int od, int do_)> zakresy2)
     {
         var sb = new StringBuilder();
+
         string fA = Path.GetFileNameWithoutExtension(nazwaA);
         string fB = Path.GetFileNameWithoutExtension(nazwaB);
         var ci = System.Globalization.CultureInfo.InvariantCulture;
 
         sb.AppendLine("PlikA,PlikB,Jaccard,A->B,B->A,Typ,Od,Do");
         sb.AppendLine($"{fA},{fB},{jaccard.ToString("F2", ci)},{aDoB.ToString("F2", ci)},{bDoA.ToString("F2", ci)},STATYSTYKA,-,-");
+
         foreach (var (od, do_) in zakresy1) sb.AppendLine($"{fA},{fB},,,,ZAKRES_A,{od},{do_}");
         foreach (var (od, do_) in zakresy2) sb.AppendLine($"{fA},{fB},,,,ZAKRES_B,{od},{do_}");
 
         return sb.ToString();
+
     }
 
     static string GenerujJSON(
@@ -425,5 +484,6 @@ class Server
             zakresy1 = zakresy1.Select(z => new { od = z.od, do_ = z.do_ }).ToList(),
             zakresy2 = zakresy2.Select(z => new { od = z.od, do_ = z.do_ }).ToList()
         }, Formatting.Indented);
+
     }
 }

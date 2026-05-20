@@ -20,10 +20,8 @@ namespace GUI
         private Timer timerInterfejsu;
         private List<WynikPary> wczytaneWyniki = new List<WynikPary>();
         private List<string> _wybranePliki = new List<string>();
-
         private static readonly object _plikLock = new object();
         private static readonly object _logLock = new object();
-
         private const int SLOTOW_NA_SERWER = 4;
         private int _licznikZadan = -1;
         const int TIMEOUT_MS = 300_000;
@@ -54,15 +52,18 @@ namespace GUI
                 while (_idle.TryTake(out TcpClient existing))
                 {
                     if (IsAlive(existing)) return existing;
+
                     existing.Close();
                     Interlocked.Decrement(ref _total);
                 }
                 Interlocked.Increment(ref _total);
+
                 var client = new TcpClient();
                 client.ReceiveTimeout = _timeoutMs;
                 client.SendTimeout = _timeoutMs;
                 client.Connect(_host, _port);
                 return client;
+
             }
 
             public void Return(TcpClient client, bool wasError = false)
@@ -74,11 +75,24 @@ namespace GUI
                     return;
                 }
                 _idle.Add(client);
+
             }
 
             private static bool IsAlive(TcpClient c)
             {
-                try { return c.Connected && c.Client != null && c.Client.Connected; }
+                try
+                {
+                    if (c == null || !c.Connected || c.Client == null || !c.Client.Connected)
+                        return false;
+
+                    // POPRAWKA: Solidna weryfikacja czy serwer nie zamknął połączenia
+                    if (c.Client.Poll(0, SelectMode.SelectRead))
+                    {
+                        byte[] test = new byte[1];
+                        if (c.Client.Receive(test, SocketFlags.Peek) == 0) return false;
+                    }
+                    return true;
+                }
                 catch { return false; }
             }
 
@@ -141,6 +155,7 @@ namespace GUI
         private void btnWybierzPliki_Click(object sender, EventArgs e)
         {
             OpenFileDialog dialog = new OpenFileDialog();
+
             dialog.Multiselect = true;
             dialog.Title = "Wybierz pliki do analizy";
             dialog.Filter = "Wszystkie pliki (*.*)|*.*";
@@ -171,11 +186,13 @@ namespace GUI
             if (jaccard >= prog)
             {
                 double t = Math.Min((jaccard - prog) / (100.0 - prog), 1.0);
+
                 kolorTekstu = Color.FromArgb(255, (int)(140 * (1.0 - t)), 0);
             }
             else
             {
                 kolorTekstu = Color.FromArgb(0, 140, 0);
+
             }
 
             string tekst = Path.GetFileName(wynik.plikA) + " vs " +
@@ -212,6 +229,7 @@ namespace GUI
             }
 
             int n = (int)numN.Value;
+
             int grainSize = (int)numGrainSize.Value;
             double prog = (double)numProg.Value;
             int port = 8001;
@@ -234,11 +252,13 @@ namespace GUI
 
             // ── FAZA 1: upload ────────────────────────────────────────────────
             lblStatus.Text = "Faza 1/2: Przesylanie plikow na serwery...";
+
             progressBar.Minimum = 0;
             progressBar.Maximum = posortowane.Count * adresy.Count;
             progressBar.Value = 0;
 
             var fileIds = new Dictionary<string, Dictionary<string, string>>();
+
             foreach (var adres in adresy)
                 fileIds[adres] = new Dictionary<string, string>();
 
@@ -294,12 +314,14 @@ namespace GUI
 
             // ── FAZA 2: compare z connection pool ────────────────────────────
             lblStatus.Text = "Faza 2/2: Porownywanie par...";
+
             progressBar.Minimum = 0;
             progressBar.Maximum = pary.Count;
             progressBar.Value = 0;
 
             int wykonane = 0;
             var wynikiBag = new ConcurrentBag<WynikPary>();
+
             int liczbaSerwerow = adresy.Count;
 
             await Task.Run(() =>
@@ -308,6 +330,7 @@ namespace GUI
                 var opcje = new ParallelOptions { MaxDegreeOfParallelism = maxWatkow };
 
                 var swFaza2 = System.Diagnostics.Stopwatch.StartNew();
+
                 Parallel.ForEach(pary, opcje, (para) =>
                 {
                     int idx = (int)((uint)Interlocked.Increment(ref _licznikZadan) % liczbaSerwerow);
@@ -320,6 +343,7 @@ namespace GUI
                         wynikiBag.Add(wynik);
 
                     int done = Interlocked.Increment(ref wykonane);
+
                     BeginInvoke(new Action(() =>
                     {
                         progressBar.Value = Math.Min(done, pary.Count);
@@ -358,7 +382,7 @@ namespace GUI
             btnWybierzPliki.Enabled = true;
         }
 
-        // ── Upload (faza 1) — bez zmian ──────────────────────────────────────
+        // ── Upload (faza 1) ──────────────────────────────────────────────────
         private string WyslijUpload(string adres, int port, string sciezka)
         {
             try
@@ -369,6 +393,7 @@ namespace GUI
                 using (TcpClient klient = new TcpClient())
                 {
                     klient.ReceiveTimeout = TIMEOUT_MS;
+
                     klient.SendTimeout = TIMEOUT_MS;
                     klient.Connect(adres, port);
 
@@ -376,14 +401,17 @@ namespace GUI
                     using (BinaryWriter writer = new BinaryWriter(stream))
                     using (BinaryReader reader = new BinaryReader(stream))
                     {
+
                         writer.Write((byte)0x01);
                         writer.Write(nazwa);
                         writer.Write((long)dane.Length);
 
                         int wyslane = 0;
+
                         while (wyslane < dane.Length)
                         {
                             int porcja = Math.Min(65536, dane.Length - wyslane);
+
                             writer.Write(dane, wyslane, porcja);
                             wyslane += porcja;
                         }
@@ -392,6 +420,7 @@ namespace GUI
                         string fileId = reader.ReadString();
                         bool wCache = reader.ReadBoolean();
                         return fileId;
+
                     }
                 }
             }
@@ -402,14 +431,18 @@ namespace GUI
             }
         }
 
-        // ── Compare z failoverem (faza 2) ────────────────────────────────────
+        // ── Compare z failoverem (faza 2) - WZBROJONY FAILOVER ───────────────
         private WynikPary WyslijCompareFailover(
             List<string> adresy,
             Dictionary<string, Dictionary<string, string>> fileIds,
             int startIdx, int port,
             string plikA, string plikB, int n, int grainSize)
         {
-            for (int i = 0; i < adresy.Count; i++)
+            // POPRAWKA: Próbujemy więcej razy, wliczając ponowne proby na tym samym serwerze.
+            // Zapewnia to tolerancję na przejściowe odrzucenia (reset połączenia) podczas piku zapytań.
+            int maxProby = Math.Max(adresy.Count * 3, 5);
+
+            for (int i = 0; i < maxProby; i++)
             {
                 int aktIdx = (startIdx + i) % adresy.Count;
                 string adres = adresy[aktIdx];
@@ -418,17 +451,21 @@ namespace GUI
                     !fileIds[adres].TryGetValue(plikB, out string idB))
                 {
                     ZapiszLog($"[FAILOVER] Serwer {adres} nie ma file_id dla " +
-                              $"{Path.GetFileName(plikA)} vs {Path.GetFileName(plikB)}. Probuje nastepny...");
+                        $"{Path.GetFileName(plikA)} vs {Path.GetFileName(plikB)}. Probuje nastepny...");
                     continue;
                 }
 
                 var wynik = WyslijCompareZPuli(adres, port, idA, idB, plikA, plikB, n, grainSize);
+
                 if (wynik != null) return wynik;
 
-                ZapiszLog($"[FAILOVER] COMPARE na {adres}:{port} zawiodlo. Probuje nastepny...");
+                ZapiszLog($"[FAILOVER] COMPARE na {adres}:{port} zawiodlo (proba {i + 1}/{maxProby}). Probuje ponownie po przerwie...");
+
+                // BACKOFF: Daje serwerowi chwilę na oddech przed następną próbą wysłania zapytania
+                Thread.Sleep(300);
             }
 
-            ZapiszLog($"[BLAD] Wszystkie serwery zawiodly dla " +
+            ZapiszLog($"[BLAD] Wszystkie proby i serwery zawiodly dla " +
                       $"{Path.GetFileName(plikA)} vs {Path.GetFileName(plikB)}.");
             return null;
         }
@@ -440,9 +477,11 @@ namespace GUI
             string plikA, string plikB,
             int n, int grainSize)
         {
+
             var pool = GetPool(adres, port);
             TcpClient klient = null;
             bool blad = false;
+
             var sw = System.Diagnostics.Stopwatch.StartNew();
 
             try
@@ -461,18 +500,22 @@ namespace GUI
                 writer.Flush();
 
                 double jaccard = reader.ReadDouble();
+
                 if (jaccard < 0)
                 {
                     ZapiszLog($"[COMPARE ERROR] Serwer {adres} nie rozpoznal file_id.");
+
                     blad = true;
                     return null;
                 }
 
                 double aDoB = reader.ReadDouble();
+
                 double bDoA = reader.ReadDouble();
 
                 int liczbaZakresow1 = reader.ReadInt32();
                 var zakresy1 = new List<Zakres>(liczbaZakresow1);
+
                 for (int i = 0; i < liczbaZakresow1; i++)
                     zakresy1.Add(new Zakres { od = reader.ReadInt32(), do_ = reader.ReadInt32() });
 
@@ -489,6 +532,7 @@ namespace GUI
                 ZapiszJSONLokalnie(plikA, plikB, json);
 
                 sw.Stop();
+
                 ZapiszLog($"[CZAS] {Path.GetFileName(plikA)} vs {Path.GetFileName(plikB)} " +
                           $"@ {adres} (pool) — {sw.ElapsedMilliseconds}ms");
 
@@ -502,6 +546,7 @@ namespace GUI
                     zakresy1 = zakresy1,
                     zakresy2 = zakresy2
                 };
+
             }
             catch (SocketException ex) { blad = true; ZapiszLog($"[SOCKET ERROR] {adres}:{port} — {ex.Message}"); return null; }
             catch (IOException ex) { blad = true; ZapiszLog($"[IO ERROR] {adres}:{port} — {ex.Message}"); return null; }
@@ -517,9 +562,11 @@ namespace GUI
         private List<(string, string)> GenerujPary(List<string> pliki)
         {
             var pary = new List<(string, string)>();
+
             for (int i = 0; i < pliki.Count; i++)
                 for (int j = i + 1; j < pliki.Count; j++)
                     pary.Add((pliki[i], pliki[j]));
+
             return pary;
         }
 
@@ -527,10 +574,12 @@ namespace GUI
         private void OdswiezListe()
         {
             listPary.BeginUpdate();
+
             listPary.Items.Clear();
             foreach (var wynik in wczytaneWyniki)
                 listPary.Items.Add(
                     Path.GetFileName(wynik.plikA) + " vs " + Path.GetFileName(wynik.plikB));
+
             listPary.EndUpdate();
         }
 
@@ -538,17 +587,20 @@ namespace GUI
         private void ListPary_SelectedIndexChanged(object sender, EventArgs e)
         {
             int indeks = listPary.SelectedIndex;
+
             if (indeks < 0 || indeks >= wczytaneWyniki.Count) return;
 
             WynikPary wynik = wczytaneWyniki[indeks];
 
             lblNazwaA.Text = Path.GetFileName(wynik.plikA) + $" (A→B: {wynik.aDoB:F2}%)";
+
             lblNazwaB.Text = Path.GetFileName(wynik.plikB) + $" (B→A: {wynik.bDoA:F2}%)";
 
             rtbPlikA.Text = "Wczytywanie...";
             rtbPlikB.Text = "Wczytywanie...";
 
             string sciezkaA = wynik.plikA;
+
             string sciezkaB = wynik.plikB;
             var zakresy1 = wynik.zakresy1;
             var zakresy2 = wynik.zakresy2;
@@ -560,12 +612,14 @@ namespace GUI
 
                 this.Invoke((Action)(() =>
                 {
+
                     rtbPlikA.Text = tekstA;
                     rtbPlikB.Text = tekstB;
                     PodswietlFragmenty(rtbPlikA, zakresy1);
                     PodswietlFragmenty(rtbPlikB, zakresy2);
                 }));
             });
+
         }
 
         private string WczytajTekstLokalnie(string sciezka)
@@ -574,11 +628,13 @@ namespace GUI
             {
                 if (File.Exists(sciezka))
                     return File.ReadAllText(sciezka);
+
                 return $"[Plik niedostepny: {sciezka}]";
             }
             catch (Exception ex)
             {
                 return $"[Blad odczytu: {ex.Message}]";
+
             }
         }
 
@@ -586,9 +642,11 @@ namespace GUI
         private void PodswietlFragmenty(RichTextBox rtb, List<Zakres> zakresy)
         {
             SendMessage(rtb.Handle, WM_SETREDRAW, false, 0);
+
             try
             {
                 rtb.SelectAll();
+
                 rtb.SelectionBackColor = Color.White;
 
                 if (zakresy != null)
@@ -596,22 +654,28 @@ namespace GUI
                     foreach (var zakres in zakresy)
                     {
                         int od = zakres.od;
+
                         int dlugosc = zakres.do_ - zakres.od;
 
                         if (od < 0 || od >= rtb.TextLength) continue;
+
                         if (od + dlugosc > rtb.TextLength)
                             dlugosc = rtb.TextLength - od;
+
                         if (dlugosc <= 0) continue;
 
                         rtb.Select(od, dlugosc);
                         rtb.SelectionBackColor = Color.Yellow;
+
                     }
                 }
                 rtb.Select(0, 0);
+
             }
             finally
             {
                 SendMessage(rtb.Handle, WM_SETREDRAW, true, 0);
+
                 rtb.Invalidate();
             }
         }
@@ -620,6 +684,7 @@ namespace GUI
         private void btnWczytaj_Click(object sender, EventArgs e)
         {
             FolderBrowserDialog dialog = new FolderBrowserDialog();
+
             dialog.Description = "Wybierz folder z wynikami (Raporty)";
 
             if (dialog.ShowDialog() != DialogResult.OK) return;
@@ -628,6 +693,7 @@ namespace GUI
             lblFolder.Text = folder;
 
             wczytaneWyniki.Clear();
+
             listPary.Items.Clear();
 
             string[] plikiJson = Directory.GetFiles(folder, "*.json");
@@ -636,28 +702,34 @@ namespace GUI
             {
                 MessageBox.Show("Nie znaleziono zadnych plikow JSON w tym folderze!",
                     "Brak wynikow", MessageBoxButtons.OK, MessageBoxIcon.Information);
+
                 return;
             }
 
             int bledy = 0;
+
             foreach (string plikJson in plikiJson)
             {
                 try
                 {
                     string zawartosc = File.ReadAllText(plikJson);
+
                     WynikPary wynik = JsonConvert.DeserializeObject<WynikPary>(zawartosc);
 
                     if (wynik == null || wynik.plikA == null || wynik.plikB == null)
                     {
                         bledy++;
+
                         continue;
                     }
                     wczytaneWyniki.Add(wynik);
+
                 }
                 catch { bledy++; }
             }
 
             wczytaneWyniki.Sort((a, b) => b.jaccard.CompareTo(a.jaccard));
+
             OdswiezListe();
 
             string komunikat = $"Wczytano {wczytaneWyniki.Count} wynikow.";
@@ -665,6 +737,7 @@ namespace GUI
 
             MessageBox.Show(komunikat, "Wczytywanie zakonczone",
                 MessageBoxButtons.OK, MessageBoxIcon.Information);
+
         }
 
         // ── Zapis CSV / JSON ─────────────────────────────────────────────────
@@ -673,11 +746,13 @@ namespace GUI
             try
             {
                 Directory.CreateDirectory("Raporty");
+
                 string suffix = Guid.NewGuid().ToString("N").Substring(0, 4);
                 string path = Path.Combine("Raporty",
                     $"{Path.GetFileNameWithoutExtension(plikA)}_VS_" +
                     $"{Path.GetFileNameWithoutExtension(plikB)}_" +
                     $"{DateTime.Now:yyyyMMdd_HHmmss}_{suffix}.csv");
+
                 lock (_plikLock) File.WriteAllText(path, csv);
             }
             catch { }
@@ -688,11 +763,13 @@ namespace GUI
             try
             {
                 Directory.CreateDirectory("Raporty");
+
                 string suffix = Guid.NewGuid().ToString("N").Substring(0, 4);
                 string path = Path.Combine("Raporty",
                     $"{Path.GetFileNameWithoutExtension(plikA)}_VS_" +
                     $"{Path.GetFileNameWithoutExtension(plikB)}_" +
                     $"{DateTime.Now:yyyyMMdd_HHmmss}_{suffix}.json");
+
                 lock (_plikLock) File.WriteAllText(path, json);
             }
             catch { }
@@ -704,9 +781,11 @@ namespace GUI
             try
             {
                 Directory.CreateDirectory("Raporty");
+
                 string plik = Path.Combine("Raporty", "errors.log");
                 string linia = $"{DateTime.Now:yyyy-MM-dd HH:mm:ss} {komunikat}";
                 lock (_logLock) File.AppendAllText(plik, linia + Environment.NewLine);
+
             }
             catch { }
         }
