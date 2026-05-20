@@ -22,8 +22,8 @@ namespace GUI
         private List<string> _wybranePliki = new List<string>();
         private static readonly object _plikLock = new object();
         private static readonly object _logLock = new object();
-        private const int SLOTOW_NA_SERWER = 4;
-        private int _licznikZadan = -1;
+        private const int SLOTOW_NA_SERWER = 4; //
+        private int _licznikZadan = -1; // ← to musi tu być
         const int TIMEOUT_MS = 300_000;
 
         [System.Runtime.InteropServices.DllImport("user32.dll")]
@@ -121,6 +121,9 @@ namespace GUI
             base.OnFormClosed(e);
             foreach (var pool in _pools.Values) pool.Dispose();
             _pools.Clear();
+
+            stoper.Stop();
+            timerInterfejsu.Stop();
         }
 
         // ── Model danych ─────────────────────────────────────────────────────
@@ -207,6 +210,7 @@ namespace GUI
                 return;
             }
 
+            int slotsPerServer = Math.Max(2, 16 / adresy.Count);
             int n = (int)numN.Value;
             int grainSize = (int)numGrainSize.Value;
             double prog = (double)numProg.Value;
@@ -224,7 +228,7 @@ namespace GUI
             timerInterfejsu.Start();
             _licznikZadan = -1;
 
-            // ── FAZA 1: UPLOAD (Współbieżny i limitowany) ────────────────────────────────────────────────
+            // ── FAZA 1: UPLOAD ───────────────────────────────────────────────────────
             lblStatus.Text = "Faza 1/2: Przesylanie plikow na serwery...";
             progressBar.Minimum = 0;
             progressBar.Maximum = posortowane.Count * adresy.Count;
@@ -239,7 +243,7 @@ namespace GUI
             await Task.Run(async () =>
             {
                 var uploadTasks = new List<Task>();
-                using (var uploadThrottle = new SemaphoreSlim(4)) // Maksymalnie 4 równoległe uploady sieciowe
+                using (var uploadThrottle = new SemaphoreSlim(4))
                 {
                     foreach (var adres in adresy)
                     {
@@ -285,7 +289,7 @@ namespace GUI
             if (!uploadOK)
                 MessageBox.Show("Nie udalo sie przeslac niektorych plikow.\nSprawdz errors.log.", "Blad uploadu", MessageBoxButtons.OK, MessageBoxIcon.Warning);
 
-            // ── FAZA 2: COMPARE (Dynamic Load Balancing) ────────────────────────────
+            // ── FAZA 2: COMPARE ──────────────────────────────────────────────────────
             lblStatus.Text = "Faza 2/2: Porownywanie par...";
             progressBar.Minimum = 0;
             progressBar.Maximum = pary.Count;
@@ -296,14 +300,11 @@ namespace GUI
 
             await Task.Run(() =>
             {
-                // Inicjalizacja puli "slotów" dostępnych na serwerach
                 var dostepneSerwery = new ConcurrentQueue<string>();
                 foreach (var adres in adresy)
-                {
-                    for (int i = 0; i < SLOTOW_NA_SERWER; i++) dostepneSerwery.Enqueue(adres);
-                }
+                    for (int i = 0; i < slotsPerServer; i++) dostepneSerwery.Enqueue(adres);
 
-                int maxWatkow = adresy.Count * SLOTOW_NA_SERWER;
+                int maxWatkow = adresy.Count * slotsPerServer;
                 var opcje = new ParallelOptions { MaxDegreeOfParallelism = maxWatkow };
 
                 var swFaza2 = System.Diagnostics.Stopwatch.StartNew();
@@ -311,11 +312,8 @@ namespace GUI
                 Parallel.ForEach(pary, opcje, (para) =>
                 {
                     string serwerAdres;
-                    // Wątek cierpliwie czeka na pierwszy wolny slot z dowolnego serwera
                     while (!dostepneSerwery.TryDequeue(out serwerAdres))
-                    {
                         Thread.Sleep(5);
-                    }
 
                     try
                     {
@@ -326,7 +324,6 @@ namespace GUI
                     }
                     finally
                     {
-                        // Zwracamy slot do puli, by inni mogli z niego skorzystać
                         dostepneSerwery.Enqueue(serwerAdres);
                     }
 
@@ -337,6 +334,7 @@ namespace GUI
                         lblStatus.Text = $"Faza 2/2: {Path.GetFileName(para.Item1)} vs {Path.GetFileName(para.Item2)}";
                     }));
                 });
+
                 swFaza2.Stop();
                 ZapiszLog($"[FAZA2] Porownywanie {pary.Count} par: {swFaza2.ElapsedMilliseconds}ms ({adresy.Count} serwerow, {maxWatkow} max watkow)");
             });

@@ -48,7 +48,7 @@ class Server
         _logQueue.TryAdd($"[{DateTime.Now:HH:mm:ss}] {komunikat}");
     }
 
-    static void Main()
+    static async Task Main()
     {
         TcpListener serwer = new TcpListener(IPAddress.Any, port);
         serwer.Start();
@@ -57,43 +57,45 @@ class Server
 
         while (true)
         {
-            TcpClient klient = serwer.AcceptTcpClient();
-            Task.Run(() => ObsluzKlienta(klient));
+            TcpClient klient = await serwer.AcceptTcpClientAsync();
+            _ = ObsluzKlienta(klient);
         }
     }
 
-    static void ObsluzKlienta(TcpClient klient)
+    static async Task ObsluzKlienta(TcpClient klient)
     {
         klient.ReceiveTimeout = 300_000;
         klient.SendTimeout = 300_000;
 
-        semafor.Wait();
         try
         {
             using (NetworkStream stream = klient.GetStream())
-            using (BinaryReader reader = new BinaryReader(stream))
-            using (BinaryWriter writer = new BinaryWriter(stream))
+            using (BinaryReader reader = new BinaryReader(stream, Encoding.UTF8, leaveOpen: true))
+            using (BinaryWriter writer = new BinaryWriter(stream, Encoding.UTF8, leaveOpen: true))
             {
-                byte komenda = reader.ReadByte();
+                // Pętla — jedno połączenie obsługuje wiele żądań
+                while (true)
+                {
+                    byte komenda;
+                    try { komenda = reader.ReadByte(); }
+                    catch { break; } // klient rozłączył się
 
-                if (komenda == 0x01)
-                    ObsluzUpload(reader, writer);
-                else if (komenda == 0x02)
-                    ObsluzCompare(reader, writer);
-                else
-                    Log($"Nieznana komenda: 0x{komenda:X2}");
+                    await semafor.WaitAsync(); // nie blokuj wątku puli
+                    try
+                    {
+                        if (komenda == 0x01) ObsluzUpload(reader, writer);
+                        else if (komenda == 0x02) ObsluzCompare(reader, writer);
+                        else break;
+                    }
+                    finally { semafor.Release(); }
+                }
             }
         }
-        catch (Exception ex)
-        {
-            Log($"BŁĄD: {ex.GetType().Name} — {ex.Message}");
-        }
-        finally
-        {
-            semafor.Release();
-            klient.Close();
-        }
+        catch (Exception ex) { Log($"BŁĄD: {ex.Message}"); }
+        finally { klient.Close(); }
     }
+
+
 
     // ── UPLOAD ───────────────────────────────────────────────────────────────
     static void ObsluzUpload(BinaryReader reader, BinaryWriter writer)
