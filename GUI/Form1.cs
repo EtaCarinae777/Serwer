@@ -28,6 +28,10 @@ namespace GUI
         private int _licznikZadan = -1;
         const int TIMEOUT_MS = 300_000;
 
+        [System.Runtime.InteropServices.DllImport("user32.dll")]
+        static extern IntPtr SendMessage(IntPtr hWnd, int wMsg, bool wParam, int lParam);
+        const int WM_SETREDRAW = 11;
+
         public Form1()
         {
             InitializeComponent();
@@ -536,7 +540,8 @@ namespace GUI
         // ── Podswietlanie ────────────────────────────────────────────────────
         private void PodswietlFragmenty(RichTextBox rtb, List<Zakres> zakresy)
         {
-            rtb.Visible = false;
+            SendMessage(rtb.Handle, WM_SETREDRAW, false, 0);
+
             try
             {
                 rtb.SelectAll();
@@ -563,7 +568,8 @@ namespace GUI
             }
             finally
             {
-                rtb.Visible = true;
+                SendMessage(rtb.Handle, WM_SETREDRAW, true, 0);
+                rtb.Invalidate();
             }
         }
 
