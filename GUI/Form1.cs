@@ -1,10 +1,10 @@
 ﻿using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Drawing;
 using System.IO;
 using System.Linq;
 using System.Net.Sockets;
-using System.Security.Cryptography;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
@@ -24,7 +24,7 @@ namespace GUI
         private static readonly object _plikLock = new object();
         private static readonly object _logLock = new object();
 
-        private const int SLOTOW_NA_SERWER = 8;
+        private const int SLOTOW_NA_SERWER = 4;
         private int _licznikZadan = -1;
         const int TIMEOUT_MS = 300_000;
 
@@ -32,6 +32,71 @@ namespace GUI
         static extern IntPtr SendMessage(IntPtr hWnd, int wMsg, bool wParam, int lParam);
         const int WM_SETREDRAW = 11;
 
+        // ── Connection Pool (zagnieżdżone) ────────────────────────────────────
+
+        private sealed class TcpConnectionPool : IDisposable
+        {
+            private readonly string _host;
+            private readonly int _port;
+            private readonly int _timeoutMs;
+            private readonly ConcurrentBag<TcpClient> _idle = new ConcurrentBag<TcpClient>();
+            private int _total = 0;
+
+            public TcpConnectionPool(string host, int port, int timeoutMs = 300_000)
+            {
+                _host = host;
+                _port = port;
+                _timeoutMs = timeoutMs;
+            }
+
+            public TcpClient Checkout()
+            {
+                while (_idle.TryTake(out TcpClient existing))
+                {
+                    if (IsAlive(existing)) return existing;
+                    existing.Close();
+                    Interlocked.Decrement(ref _total);
+                }
+                Interlocked.Increment(ref _total);
+                var client = new TcpClient();
+                client.ReceiveTimeout = _timeoutMs;
+                client.SendTimeout = _timeoutMs;
+                client.Connect(_host, _port);
+                return client;
+            }
+
+            public void Return(TcpClient client, bool wasError = false)
+            {
+                if (wasError || !IsAlive(client))
+                {
+                    client.Close();
+                    Interlocked.Decrement(ref _total);
+                    return;
+                }
+                _idle.Add(client);
+            }
+
+            private static bool IsAlive(TcpClient c)
+            {
+                try { return c.Connected && c.Client != null && c.Client.Connected; }
+                catch { return false; }
+            }
+
+            public void Dispose()
+            {
+                while (_idle.TryTake(out var c))
+                    try { c.Close(); } catch { }
+            }
+        }
+
+        private static readonly ConcurrentDictionary<string, TcpConnectionPool> _pools
+            = new ConcurrentDictionary<string, TcpConnectionPool>();
+
+        private TcpConnectionPool GetPool(string host, int port)
+            => _pools.GetOrAdd($"{host}:{port}",
+                _ => new TcpConnectionPool(host, port, TIMEOUT_MS));
+
+        // ─────────────────────────────────────────────────────────────────────
 
         public Form1()
         {
@@ -45,6 +110,13 @@ namespace GUI
             timerInterfejsu.Tick += (s, e) => {
                 lblTimer.Text = $"Czas: {stoper.Elapsed:hh\\:mm\\:ss}";
             };
+        }
+
+        protected override void OnFormClosed(FormClosedEventArgs e)
+        {
+            base.OnFormClosed(e);
+            foreach (var pool in _pools.Values) pool.Dispose();
+            _pools.Clear();
         }
 
         // ── Model danych ─────────────────────────────────────────────────────
@@ -160,13 +232,12 @@ namespace GUI
             timerInterfejsu.Start();
             _licznikZadan = -1;
 
-            // ── FAZA 1: upload kazdego pliku raz na kazdy serwer ─────────────
+            // ── FAZA 1: upload ────────────────────────────────────────────────
             lblStatus.Text = "Faza 1/2: Przesylanie plikow na serwery...";
             progressBar.Minimum = 0;
             progressBar.Maximum = posortowane.Count * adresy.Count;
             progressBar.Value = 0;
 
-            // fileIds[adres][sciezka] = file_id zwrocony przez serwer
             var fileIds = new Dictionary<string, Dictionary<string, string>>();
             foreach (var adres in adresy)
                 fileIds[adres] = new Dictionary<string, string>();
@@ -213,22 +284,22 @@ namespace GUI
                 var swFaza1 = System.Diagnostics.Stopwatch.StartNew();
                 Task.WaitAll(uploadTasks.ToArray());
                 swFaza1.Stop();
-                ZapiszLog($"[FAZA1] Upload wszystkich plikow: {swFaza1.ElapsedMilliseconds}ms ({posortowane.Count} plikow x {adresy.Count} serwerow)");
+                ZapiszLog($"[FAZA1] Upload: {swFaza1.ElapsedMilliseconds}ms ({posortowane.Count} plikow x {adresy.Count} serwerow)");
             });
 
             if (!uploadOK)
                 MessageBox.Show(
-                    "Nie udalo sie przeslac niektorych plikow na serwery.\nSprawdz errors.log.",
+                    "Nie udalo sie przeslac niektorych plikow.\nSprawdz errors.log.",
                     "Blad uploadu", MessageBoxButtons.OK, MessageBoxIcon.Warning);
 
-            // ── FAZA 2: porownywanie par po file_id ──────────────────────────
+            // ── FAZA 2: compare z connection pool ────────────────────────────
             lblStatus.Text = "Faza 2/2: Porownywanie par...";
             progressBar.Minimum = 0;
             progressBar.Maximum = pary.Count;
             progressBar.Value = 0;
 
             int wykonane = 0;
-            var wynikiBag = new System.Collections.Concurrent.ConcurrentBag<WynikPary>();
+            var wynikiBag = new ConcurrentBag<WynikPary>();
             int liczbaSerwerow = adresy.Count;
 
             await Task.Run(() =>
@@ -268,8 +339,8 @@ namespace GUI
 
             if (oczekiwane != otrzymane)
                 MessageBox.Show(
-                    $"Oczekiwano par: {oczekiwane}\nOtrzymano wynikow: {otrzymane}\n" +
-                    $"Nieudane: {oczekiwane - otrzymane}\n\nSprawdz errors.log w folderze Raporty.",
+                    $"Oczekiwano: {oczekiwane}\nOtrzymano: {otrzymane}\n" +
+                    $"Nieudane: {oczekiwane - otrzymane}\n\nSprawdz errors.log.",
                     "Uwaga - brakujace wyniki",
                     MessageBoxButtons.OK, MessageBoxIcon.Warning);
 
@@ -287,9 +358,7 @@ namespace GUI
             btnWybierzPliki.Enabled = true;
         }
 
-        // ── Upload pliku na serwer (faza 1) ──────────────────────────────────
-        // Protokol: [0x01] [nazwa:string] [rozmiar:int64] [dane:bytes]
-        // Odpowiedz: [file_id:string] [juz_w_cache:bool]
+        // ── Upload (faza 1) — bez zmian ──────────────────────────────────────
         private string WyslijUpload(string adres, int port, string sciezka)
         {
             try
@@ -348,110 +417,99 @@ namespace GUI
                 if (!fileIds[adres].TryGetValue(plikA, out string idA) ||
                     !fileIds[adres].TryGetValue(plikB, out string idB))
                 {
-                    ZapiszLog($"[FAILOVER] Serwer {adres} nie ma file_id dla pary " +
+                    ZapiszLog($"[FAILOVER] Serwer {adres} nie ma file_id dla " +
                               $"{Path.GetFileName(plikA)} vs {Path.GetFileName(plikB)}. Probuje nastepny...");
                     continue;
                 }
 
-                var wynik = WyslijCompare(adres, port, idA, idB, plikA, plikB, n, grainSize);
-                if (wynik != null)
-                    return wynik;
+                var wynik = WyslijCompareZPuli(adres, port, idA, idB, plikA, plikB, n, grainSize);
+                if (wynik != null) return wynik;
 
-                ZapiszLog($"[FAILOVER] COMPARE na {adres}:{port} zawiodlo dla pary " +
-                          $"{Path.GetFileName(plikA)} vs {Path.GetFileName(plikB)}. Probuje nastepny...");
+                ZapiszLog($"[FAILOVER] COMPARE na {adres}:{port} zawiodlo. Probuje nastepny...");
             }
 
-            ZapiszLog($"[BLAD] Wszystkie serwery zawiodly dla pary " +
+            ZapiszLog($"[BLAD] Wszystkie serwery zawiodly dla " +
                       $"{Path.GetFileName(plikA)} vs {Path.GetFileName(plikB)}.");
             return null;
         }
 
-        // ── Wyslanie COMPARE (faza 2) ─────────────────────────────────────────
-        // Protokol: [0x02] [fileId_A:string] [fileId_B:string] [n:int32] [grainSize:int32]
-        private WynikPary WyslijCompare(
+        // ── Compare z connection pool ─────────────────────────────────────────
+        private WynikPary WyslijCompareZPuli(
             string adres, int port,
             string fileIdA, string fileIdB,
             string plikA, string plikB,
             int n, int grainSize)
         {
+            var pool = GetPool(adres, port);
+            TcpClient klient = null;
+            bool blad = false;
             var sw = System.Diagnostics.Stopwatch.StartNew();
+
             try
             {
-                using (TcpClient klient = new TcpClient())
+                klient = pool.Checkout();
+
+                var stream = klient.GetStream();
+                var writer = new BinaryWriter(stream, Encoding.UTF8, leaveOpen: true);
+                var reader = new BinaryReader(stream, Encoding.UTF8, leaveOpen: true);
+
+                writer.Write((byte)0x02);
+                writer.Write(fileIdA);
+                writer.Write(fileIdB);
+                writer.Write(n);
+                writer.Write(grainSize);
+                writer.Flush();
+
+                double jaccard = reader.ReadDouble();
+                if (jaccard < 0)
                 {
-                    klient.ReceiveTimeout = TIMEOUT_MS;
-                    klient.SendTimeout = TIMEOUT_MS;
-                    klient.Connect(adres, port);
-
-                    using (NetworkStream stream = klient.GetStream())
-                    using (BinaryWriter writer = new BinaryWriter(stream))
-                    using (BinaryReader reader = new BinaryReader(stream))
-                    {
-                        writer.Write((byte)0x02);
-                        writer.Write(fileIdA);
-                        writer.Write(fileIdB);
-                        writer.Write(n);
-                        writer.Write(grainSize);
-                        writer.Flush();
-
-                        double jaccard = reader.ReadDouble();
-
-                        if (jaccard < 0)
-                        {
-                            ZapiszLog($"[COMPARE ERROR] Serwer {adres} nie rozpoznal file_id.");
-                            return null;
-                        }
-
-                        double aDoB = reader.ReadDouble();
-                        double bDoA = reader.ReadDouble();
-
-                        int liczbaZakresow1 = reader.ReadInt32();
-                        var zakresy1 = new List<Zakres>();
-                        for (int i = 0; i < liczbaZakresow1; i++)
-                            zakresy1.Add(new Zakres { od = reader.ReadInt32(), do_ = reader.ReadInt32() });
-
-                        int liczbaZakresow2 = reader.ReadInt32();
-                        var zakresy2 = new List<Zakres>();
-                        for (int i = 0; i < liczbaZakresow2; i++)
-                            zakresy2.Add(new Zakres { od = reader.ReadInt32(), do_ = reader.ReadInt32() });
-
-                        string csv = reader.ReadString();
-                        string json = reader.ReadString();
-                        reader.ReadInt64();
-
-                        ZapiszCSVLokalnie(plikA, plikB, csv);
-                        ZapiszJSONLokalnie(plikA, plikB, json);
-
-                        sw.Stop();
-                        ZapiszLog($"[CZAS] {Path.GetFileName(plikA)} vs {Path.GetFileName(plikB)} @ {adres} - connect+compare: {sw.ElapsedMilliseconds}ms");
-
-                        return new WynikPary
-                        {
-                            plikA = plikA,
-                            plikB = plikB,
-                            jaccard = jaccard,
-                            aDoB = aDoB,
-                            bDoA = bDoA,
-                            zakresy1 = zakresy1,
-                            zakresy2 = zakresy2
-                        };
-                    }
+                    ZapiszLog($"[COMPARE ERROR] Serwer {adres} nie rozpoznal file_id.");
+                    blad = true;
+                    return null;
                 }
+
+                double aDoB = reader.ReadDouble();
+                double bDoA = reader.ReadDouble();
+
+                int liczbaZakresow1 = reader.ReadInt32();
+                var zakresy1 = new List<Zakres>(liczbaZakresow1);
+                for (int i = 0; i < liczbaZakresow1; i++)
+                    zakresy1.Add(new Zakres { od = reader.ReadInt32(), do_ = reader.ReadInt32() });
+
+                int liczbaZakresow2 = reader.ReadInt32();
+                var zakresy2 = new List<Zakres>(liczbaZakresow2);
+                for (int i = 0; i < liczbaZakresow2; i++)
+                    zakresy2.Add(new Zakres { od = reader.ReadInt32(), do_ = reader.ReadInt32() });
+
+                string csv = reader.ReadString();
+                string json = reader.ReadString();
+                reader.ReadInt64();
+
+                ZapiszCSVLokalnie(plikA, plikB, csv);
+                ZapiszJSONLokalnie(plikA, plikB, json);
+
+                sw.Stop();
+                ZapiszLog($"[CZAS] {Path.GetFileName(plikA)} vs {Path.GetFileName(plikB)} " +
+                          $"@ {adres} (pool) — {sw.ElapsedMilliseconds}ms");
+
+                return new WynikPary
+                {
+                    plikA = plikA,
+                    plikB = plikB,
+                    jaccard = jaccard,
+                    aDoB = aDoB,
+                    bDoA = bDoA,
+                    zakresy1 = zakresy1,
+                    zakresy2 = zakresy2
+                };
             }
-            catch (SocketException ex)
+            catch (SocketException ex) { blad = true; ZapiszLog($"[SOCKET ERROR] {adres}:{port} — {ex.Message}"); return null; }
+            catch (IOException ex) { blad = true; ZapiszLog($"[IO ERROR] {adres}:{port} — {ex.Message}"); return null; }
+            catch (Exception ex) { blad = true; ZapiszLog($"[ERROR] {adres}:{port} — {ex.Message}"); return null; }
+            finally
             {
-                ZapiszLog($"[SOCKET ERROR] {adres}:{port} - {ex.Message}");
-                return null;
-            }
-            catch (IOException ex)
-            {
-                ZapiszLog($"[IO ERROR] {adres}:{port} - {ex.Message}");
-                return null;
-            }
-            catch (Exception ex)
-            {
-                ZapiszLog($"[ERROR] {adres}:{port} - {ex.Message}");
-                return null;
+                if (klient != null)
+                    pool.Return(klient, wasError: blad);
             }
         }
 
@@ -504,7 +562,6 @@ namespace GUI
                 {
                     rtbPlikA.Text = tekstA;
                     rtbPlikB.Text = tekstB;
-                    // NA RAZIE BEZ PODSWIETLANIA
                     PodswietlFragmenty(rtbPlikA, zakresy1);
                     PodswietlFragmenty(rtbPlikB, zakresy2);
                 }));
@@ -528,9 +585,7 @@ namespace GUI
         // ── Podswietlanie ────────────────────────────────────────────────────
         private void PodswietlFragmenty(RichTextBox rtb, List<Zakres> zakresy)
         {
-            // zatrzymujemy rysowanie na poziomie systemu Windows
             SendMessage(rtb.Handle, WM_SETREDRAW, false, 0);
-
             try
             {
                 rtb.SelectAll();
@@ -552,12 +607,10 @@ namespace GUI
                         rtb.SelectionBackColor = Color.Yellow;
                     }
                 }
-
                 rtb.Select(0, 0);
             }
             finally
             {
-                // wznawiamy rysowanie i wymuszamy jedno odswiezenie
                 SendMessage(rtb.Handle, WM_SETREDRAW, true, 0);
                 rtb.Invalidate();
             }
@@ -599,21 +652,16 @@ namespace GUI
                         bledy++;
                         continue;
                     }
-
                     wczytaneWyniki.Add(wynik);
                 }
-                catch
-                {
-                    bledy++;
-                }
+                catch { bledy++; }
             }
 
             wczytaneWyniki.Sort((a, b) => b.jaccard.CompareTo(a.jaccard));
             OdswiezListe();
 
             string komunikat = $"Wczytano {wczytaneWyniki.Count} wynikow.";
-            if (bledy > 0)
-                komunikat += $"\nPominieto {bledy} uszkodzonych plikow.";
+            if (bledy > 0) komunikat += $"\nPominieto {bledy} uszkodzonych plikow.";
 
             MessageBox.Show(komunikat, "Wczytywanie zakonczone",
                 MessageBoxButtons.OK, MessageBoxIcon.Information);
@@ -630,8 +678,7 @@ namespace GUI
                     $"{Path.GetFileNameWithoutExtension(plikA)}_VS_" +
                     $"{Path.GetFileNameWithoutExtension(plikB)}_" +
                     $"{DateTime.Now:yyyyMMdd_HHmmss}_{suffix}.csv");
-                lock (_plikLock)
-                    File.WriteAllText(path, csv);
+                lock (_plikLock) File.WriteAllText(path, csv);
             }
             catch { }
         }
@@ -646,8 +693,7 @@ namespace GUI
                     $"{Path.GetFileNameWithoutExtension(plikA)}_VS_" +
                     $"{Path.GetFileNameWithoutExtension(plikB)}_" +
                     $"{DateTime.Now:yyyyMMdd_HHmmss}_{suffix}.json");
-                lock (_plikLock)
-                    File.WriteAllText(path, json);
+                lock (_plikLock) File.WriteAllText(path, json);
             }
             catch { }
         }
@@ -660,8 +706,7 @@ namespace GUI
                 Directory.CreateDirectory("Raporty");
                 string plik = Path.Combine("Raporty", "errors.log");
                 string linia = $"{DateTime.Now:yyyy-MM-dd HH:mm:ss} {komunikat}";
-                lock (_logLock)
-                    File.AppendAllText(plik, linia + Environment.NewLine);
+                lock (_logLock) File.AppendAllText(plik, linia + Environment.NewLine);
             }
             catch { }
         }
