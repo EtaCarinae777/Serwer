@@ -59,6 +59,7 @@ namespace GUI
                 Interlocked.Increment(ref _total);
 
                 var client = new TcpClient();
+                client.NoDelay = true;         
                 client.ReceiveTimeout = _timeoutMs;
                 client.SendTimeout = _timeoutMs;
                 client.Connect(_host, _port);
@@ -75,23 +76,13 @@ namespace GUI
                     return;
                 }
                 _idle.Add(client);
-
             }
 
             private static bool IsAlive(TcpClient c)
             {
                 try
                 {
-                    if (c == null || !c.Connected || c.Client == null || !c.Client.Connected)
-                        return false;
-
-                    // POPRAWKA: Solidna weryfikacja czy serwer nie zamknął połączenia
-                    if (c.Client.Poll(0, SelectMode.SelectRead))
-                    {
-                        byte[] test = new byte[1];
-                        if (c.Client.Receive(test, SocketFlags.Peek) == 0) return false;
-                    }
-                    return true;
+                    return c != null && c.Connected && c.Client != null && c.Client.Connected;
                 }
                 catch { return false; }
             }
@@ -392,6 +383,7 @@ namespace GUI
 
                 using (TcpClient klient = new TcpClient())
                 {
+                    klient.NoDelay = true;
                     klient.ReceiveTimeout = TIMEOUT_MS;
 
                     klient.SendTimeout = TIMEOUT_MS;
@@ -472,12 +464,11 @@ namespace GUI
 
         // ── Compare z connection pool ─────────────────────────────────────────
         private WynikPary WyslijCompareZPuli(
-            string adres, int port,
-            string fileIdA, string fileIdB,
-            string plikA, string plikB,
-            int n, int grainSize)
+    string adres, int port,
+    string fileIdA, string fileIdB,
+    string plikA, string plikB,
+    int n, int grainSize)
         {
-
             var pool = GetPool(adres, port);
             TcpClient klient = null;
             bool blad = false;
@@ -487,6 +478,7 @@ namespace GUI
             try
             {
                 klient = pool.Checkout();
+                long swConnect = sw.ElapsedMilliseconds;
 
                 var stream = klient.GetStream();
                 var writer = new BinaryWriter(stream, Encoding.UTF8, leaveOpen: true);
@@ -504,18 +496,15 @@ namespace GUI
                 if (jaccard < 0)
                 {
                     ZapiszLog($"[COMPARE ERROR] Serwer {adres} nie rozpoznal file_id.");
-
                     blad = true;
                     return null;
                 }
 
                 double aDoB = reader.ReadDouble();
-
                 double bDoA = reader.ReadDouble();
 
                 int liczbaZakresow1 = reader.ReadInt32();
                 var zakresy1 = new List<Zakres>(liczbaZakresow1);
-
                 for (int i = 0; i < liczbaZakresow1; i++)
                     zakresy1.Add(new Zakres { od = reader.ReadInt32(), do_ = reader.ReadInt32() });
 
@@ -526,15 +515,15 @@ namespace GUI
 
                 string csv = reader.ReadString();
                 string json = reader.ReadString();
-                reader.ReadInt64();
+                long czasSerwera = reader.ReadInt64(); // tylko raz
+
+                sw.Stop();
+                ZapiszLog($"[TIMING] {Path.GetFileName(plikA)} vs {Path.GetFileName(plikB)} @ {adres} — " +
+                          $"connect: {swConnect}ms, caly request: {sw.ElapsedMilliseconds}ms, " +
+                          $"obliczenia serwera: {czasSerwera}ms, overhead sieciowy: {sw.ElapsedMilliseconds - czasSerwera}ms");
 
                 ZapiszCSVLokalnie(plikA, plikB, csv);
                 ZapiszJSONLokalnie(plikA, plikB, json);
-
-                sw.Stop();
-
-                ZapiszLog($"[CZAS] {Path.GetFileName(plikA)} vs {Path.GetFileName(plikB)} " +
-                          $"@ {adres} (pool) — {sw.ElapsedMilliseconds}ms");
 
                 return new WynikPary
                 {
@@ -546,7 +535,6 @@ namespace GUI
                     zakresy1 = zakresy1,
                     zakresy2 = zakresy2
                 };
-
             }
             catch (SocketException ex) { blad = true; ZapiszLog($"[SOCKET ERROR] {adres}:{port} — {ex.Message}"); return null; }
             catch (IOException ex) { blad = true; ZapiszLog($"[IO ERROR] {adres}:{port} — {ex.Message}"); return null; }
