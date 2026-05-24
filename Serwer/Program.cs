@@ -36,8 +36,8 @@ class Server
     {
         var t = new Thread(() =>
         {
-            //foreach (string msg in _logQueue.GetConsumingEnumerable())
-                //Console.WriteLine(msg);
+            foreach (string msg in _logQueue.GetConsumingEnumerable())
+                Console.WriteLine(msg);
         });
 
         t.IsBackground = true;
@@ -68,8 +68,8 @@ class Server
     static void ObsluzKlienta(TcpClient klient)
     {
         klient.ReceiveTimeout = 300_000;
-
         klient.SendTimeout = 300_000;
+        klient.NoDelay = true;  // też tu dodaj
 
         semafor.Wait();
         try
@@ -78,29 +78,24 @@ class Server
             using (BinaryReader reader = new BinaryReader(stream))
             using (BinaryWriter writer = new BinaryWriter(stream))
             {
-                // Pierwszym bajtem jest typ komendy
-                byte komenda = reader.ReadByte();
+                while (true)  // pętla zamiast jednego requestu
+                {
+                    byte komenda;
+                    try { komenda = reader.ReadByte(); }
+                    catch { break; }  // klient rozłączył się
 
-                if (komenda == 0x01)
-                    ObsluzUpload(reader, writer);
-
-                else if (komenda == 0x02)
-                    ObsluzCompare(reader, writer);
-
-                else
-                    Log($"Nieznana komenda: 0x{komenda:X2}");
-
+                    if (komenda == 0x01)
+                        ObsluzUpload(reader, writer);
+                    else if (komenda == 0x02)
+                        ObsluzCompare(reader, writer);
+                    else
+                        break;
+                }
             }
-        }
-        catch (Exception ex)
-        {
-            Log($"BŁĄD: {ex.GetType().Name} — {ex.Message}");
-
         }
         finally
         {
             semafor.Release();
-
             klient.Close();
         }
     }
