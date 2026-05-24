@@ -2,6 +2,7 @@
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Drawing;
+using System.Drawing.Drawing2D;
 using System.IO;
 using System.Linq;
 using System.Net.Sockets;
@@ -22,16 +23,22 @@ namespace GUI
         private List<string> _wybranePliki = new List<string>();
         private static readonly object _plikLock = new object();
         private static readonly object _logLock = new object();
-        private const int SLOTOW_NA_SERWER = 4;
         private int _licznikZadan = -1;
-        const int TIMEOUT_MS = 300_000;
+        private CancellationTokenSource _cts;
+
+        // Do anulowania renderowania przy szybkim przeklikowaniu listy
+        private CancellationTokenSource _selectionCts;
 
         [System.Runtime.InteropServices.DllImport("user32.dll")]
         static extern IntPtr SendMessage(IntPtr hWnd, int wMsg, bool wParam, int lParam);
         const int WM_SETREDRAW = 11;
 
-        // ── Connection Pool (zagnieżdżone) ────────────────────────────────────
+        // ── Parametry konfiguracyjne (z GUI) ─────────────────────────────────
+        private int SlotowNaSerwer => (int)numSloty.Value;
+        private int TimeoutMs => (int)numTimeout.Value * 1000;
+        private int PortSerwera => (int)numPort.Value;
 
+        // ── Connection Pool ───────────────────────────────────────────────────
         private sealed class TcpConnectionPool : IDisposable
         {
             private readonly string _host;
@@ -42,9 +49,7 @@ namespace GUI
 
             public TcpConnectionPool(string host, int port, int timeoutMs = 300_000)
             {
-                _host = host;
-                _port = port;
-                _timeoutMs = timeoutMs;
+                _host = host; _port = port; _timeoutMs = timeoutMs;
             }
 
             public TcpClient Checkout()
@@ -52,19 +57,16 @@ namespace GUI
                 while (_idle.TryTake(out TcpClient existing))
                 {
                     if (IsAlive(existing)) return existing;
-
                     existing.Close();
                     Interlocked.Decrement(ref _total);
                 }
                 Interlocked.Increment(ref _total);
-
                 var client = new TcpClient();
-                client.NoDelay = true;         
+                client.NoDelay = true;
                 client.ReceiveTimeout = _timeoutMs;
                 client.SendTimeout = _timeoutMs;
                 client.Connect(_host, _port);
                 return client;
-
             }
 
             public void Return(TcpClient client, bool wasError = false)
@@ -80,10 +82,7 @@ namespace GUI
 
             private static bool IsAlive(TcpClient c)
             {
-                try
-                {
-                    return c != null && c.Connected && c.Client != null && c.Client.Connected;
-                }
+                try { return c != null && c.Connected && c.Client != null && c.Client.Connected; }
                 catch { return false; }
             }
 
@@ -99,32 +98,15 @@ namespace GUI
 
         private TcpConnectionPool GetPool(string host, int port)
             => _pools.GetOrAdd($"{host}:{port}",
-                _ => new TcpConnectionPool(host, port, TIMEOUT_MS));
+                _ => new TcpConnectionPool(host, port, TimeoutMs));
 
-        // ─────────────────────────────────────────────────────────────────────
-
-        public Form1()
+        private void ResetPools()
         {
-            InitializeComponent();
-            listPary.SelectedIndexChanged += ListPary_SelectedIndexChanged;
-            listPary.DrawMode = DrawMode.OwnerDrawFixed;
-            listPary.DrawItem += ListPary_DrawItem;
-
-            timerInterfejsu = new Timer();
-            timerInterfejsu.Interval = 1000;
-            timerInterfejsu.Tick += (s, e) => {
-                lblTimer.Text = $"Czas: {stoper.Elapsed:hh\\:mm\\:ss}";
-            };
-        }
-
-        protected override void OnFormClosed(FormClosedEventArgs e)
-        {
-            base.OnFormClosed(e);
             foreach (var pool in _pools.Values) pool.Dispose();
             _pools.Clear();
         }
 
-        // ── Model danych ─────────────────────────────────────────────────────
+        // ── Model danych ──────────────────────────────────────────────────────
         private class WynikPary
         {
             public string plikA { get; set; }
@@ -142,19 +124,48 @@ namespace GUI
             public int do_ { get; set; }
         }
 
-        // ── Wybor plikow ─────────────────────────────────────────────────────
+        // ── Konstruktor ───────────────────────────────────────────────────────
+        public Form1()
+        {
+            InitializeComponent();
+
+            listPary.SelectedIndexChanged += ListPary_SelectedIndexChanged;
+            listPary.DrawMode = DrawMode.OwnerDrawFixed;
+            listPary.DrawItem += ListPary_DrawItem;
+
+            timerInterfejsu = new Timer();
+            timerInterfejsu.Interval = 1000;
+            timerInterfejsu.Tick += (s, e) =>
+                lblTimer.Text = $"Czas: {stoper.Elapsed:hh\\:mm\\:ss}";
+
+            var tip = new ToolTip { AutoPopDelay = 8000, InitialDelay = 400 };
+            tip.SetToolTip(numN, "Liczba słów w jednym n-gramie.\nWiększe n → mniej fałszywych trafień, ale wykrywa tylko dłuższe fragmenty.");
+            tip.SetToolTip(numProg, "Minimalny Jaccard (%) uznawany za plagiat.\nPary powyżej progu oznaczane kolorem i wykrzyknikiem.");
+            tip.SetToolTip(numSloty, "Ile równoległych połączeń TCP na jeden serwer.\nZwiększ przy szybkiej sieci i mocnych serwerach.");
+            tip.SetToolTip(numTimeout, "Timeout połączenia TCP w sekundach.\nZwiększ przy wolnej sieci lub dużych plikach.");
+            tip.SetToolTip(numPort, "Port TCP serwerów analizy (domyślnie 8001).");
+        }
+
+        protected override void OnFormClosed(FormClosedEventArgs e)
+        {
+            base.OnFormClosed(e);
+            _cts?.Cancel();
+            _selectionCts?.Cancel();
+            ResetPools();
+        }
+
+        // ── Wybór plików ──────────────────────────────────────────────────────
         private void btnWybierzPliki_Click(object sender, EventArgs e)
         {
-            OpenFileDialog dialog = new OpenFileDialog();
-
-            dialog.Multiselect = true;
-            dialog.Title = "Wybierz pliki do analizy";
-            dialog.Filter = "Wszystkie pliki (*.*)|*.*";
-
-            if (dialog.ShowDialog() != DialogResult.OK) return;
-
-            _wybranePliki = new List<string>(dialog.FileNames);
-            lblWybranePliki.Text = $"Wybrano {_wybranePliki.Count} plikow";
+            using (var dialog = new OpenFileDialog())
+            {
+                dialog.Multiselect = true;
+                dialog.Title = "Wybierz pliki do analizy";
+                dialog.Filter = "Wszystkie pliki (*.*)|*.*";
+                if (dialog.ShowDialog() != DialogResult.OK) return;
+                _wybranePliki = new List<string>(dialog.FileNames);
+                lblWybranePliki.Text = $"Wybrano {_wybranePliki.Count} plików";
+            }
         }
 
         // ── Kolorowanie listy ─────────────────────────────────────────────────
@@ -166,214 +177,347 @@ namespace GUI
             double jaccard = wynik.jaccard;
             double prog = (double)numProg.Value;
 
-            Color tlo = (e.State & DrawItemState.Selected) == DrawItemState.Selected
-                ? Color.FromArgb(220, 220, 220)
-                : Color.White;
+            bool selected = (e.State & DrawItemState.Selected) == DrawItemState.Selected;
+            Color tlo = selected ? Color.FromArgb(210, 230, 255) : Color.White;
 
-            using (SolidBrush tloB = new SolidBrush(tlo))
+            using (var tloB = new SolidBrush(tlo))
                 e.Graphics.FillRectangle(tloB, e.Bounds);
 
             Color kolorTekstu;
             if (jaccard >= prog)
             {
-                double t = Math.Min((jaccard - prog) / (100.0 - prog), 1.0);
-
-                kolorTekstu = Color.FromArgb(255, (int)(140 * (1.0 - t)), 0);
+                double t = Math.Min((jaccard - prog) / Math.Max(100.0 - prog, 1.0), 1.0);
+                kolorTekstu = Color.FromArgb(200, (int)(80 * (1.0 - t)), 0);
             }
             else
             {
-                kolorTekstu = Color.FromArgb(0, 140, 0);
-
+                kolorTekstu = Color.FromArgb(0, 130, 0);
             }
 
             string tekst = Path.GetFileName(wynik.plikA) + " vs " +
-                           Path.GetFileName(wynik.plikB) + "  -  " +
+                           Path.GetFileName(wynik.plikB) + "  —  " +
                            jaccard.ToString("F2") + "%" +
-                           (jaccard >= prog ? " !" : "");
+                           (jaccard >= prog ? "  ⚑" : "");
 
-            using (SolidBrush tekstB = new SolidBrush(kolorTekstu))
-                e.Graphics.DrawString(tekst, e.Font, tekstB, e.Bounds.X + 2, e.Bounds.Y + 2);
+            using (var tekstB = new SolidBrush(kolorTekstu))
+                e.Graphics.DrawString(tekst, e.Font, tekstB, e.Bounds.X + 4, e.Bounds.Y + 2);
 
             e.DrawFocusRectangle();
         }
 
-        // ── Glowna analiza ───────────────────────────────────────────────────
+        // ── Ustawianie stanu UI (włącz/wyłącz podczas analizy) ───────────────
+        private void UstawTrybAnalizy(bool analizaTrwa)
+        {
+            btnAnalyzuj.Enabled = !analizaTrwa;
+            btnWybierzPliki.Enabled = !analizaTrwa;
+            btnWczytaj.Enabled = !analizaTrwa;
+            btnAnuluj.Visible = analizaTrwa;
+            numN.Enabled = !analizaTrwa;
+            numProg.Enabled = !analizaTrwa;
+            numSloty.Enabled = !analizaTrwa;
+            numTimeout.Enabled = !analizaTrwa;
+            numPort.Enabled = !analizaTrwa;
+        }
+
+        private void SetStatus(string tekst, int min, int max)
+        {
+            lblStatus.Text = tekst;
+            lblStatus.ForeColor = Color.DimGray;
+            progressBar.Minimum = min;
+            progressBar.Maximum = Math.Max(max, 1);
+            progressBar.Value = 0;
+        }
+
+        private void FinalizujAnulowanie()
+        {
+            stoper.Stop();
+            timerInterfejsu.Stop();
+            lblStatus.Text = "Anulowano.";
+            lblStatus.ForeColor = Color.DimGray;
+            progressBar.Value = 0;
+            UstawTrybAnalizy(false);
+        }
+
+        private void btnAnuluj_Click(object sender, EventArgs e)
+        {
+            _cts?.Cancel();
+            lblStatus.Text = "Anulowanie...";
+        }
+
+        // ── PŁYNNY WYBÓR PARY Z LISTY (RTF W TLE) ─────────────────────────────
+        private async void ListPary_SelectedIndexChanged(object sender, EventArgs e)
+        {
+            _selectionCts?.Cancel();
+            _selectionCts = new CancellationTokenSource();
+            var token = _selectionCts.Token;
+
+            int indeks = listPary.SelectedIndex;
+            if (indeks < 0 || indeks >= wczytaneWyniki.Count) return;
+
+            WynikPary wynik = wczytaneWyniki[indeks];
+            lblNazwaA.Text = Path.GetFileName(wynik.plikA) + $"  (A→B: {wynik.aDoB:F2}%)";
+            lblNazwaB.Text = Path.GetFileName(wynik.plikB) + $"  (B→A: {wynik.bDoA:F2}%)";
+
+            rtbPlikA.Text = "Wczytywanie i renderowanie...";
+            rtbPlikB.Text = "Wczytywanie i renderowanie...";
+
+            string sciezkaA = wynik.plikA;
+            string sciezkaB = wynik.plikB;
+            var zakresy1 = wynik.zakresy1;
+            var zakresy2 = wynik.zakresy2;
+
+            try
+            {
+                // Przesuwamy budowanie tekstu RTF z żółtym tłem do pobocznego wątku.
+                // Określenie zwracanego typu krotki ułatwia inference kompilatora.
+                var (rtfA, rtfB) = await Task.Run<(string, string)>(() =>
+                {
+                    string tekstA = File.Exists(sciezkaA) ? File.ReadAllText(sciezkaA) : $"[Brak pliku: {sciezkaA}]";
+                    if (token.IsCancellationRequested) return (null, null);
+                    string generatedRtfA = GenerujRtfZPodswietleniem(tekstA, zakresy1, token);
+
+                    if (token.IsCancellationRequested) return (null, null);
+
+                    string tekstB = File.Exists(sciezkaB) ? File.ReadAllText(sciezkaB) : $"[Brak pliku: {sciezkaB}]";
+                    if (token.IsCancellationRequested) return (null, null);
+                    string generatedRtfB = GenerujRtfZPodswietleniem(tekstB, zakresy2, token);
+
+                    return (generatedRtfA, generatedRtfB);
+                }, token);
+
+                if (!token.IsCancellationRequested && rtfA != null && rtfB != null)
+                {
+                    rtbPlikA.Rtf = rtfA;
+                    rtbPlikB.Rtf = rtfB;
+                }
+            }
+            catch (OperationCanceledException) { }
+            catch (Exception ex)
+            {
+                ZapiszLog($"[UI ERROR] Błąd wyświetlania tekstu: {ex.Message}");
+            }
+        }
+
+        private string GenerujRtfZPodswietleniem(string tekst, List<Zakres> zakresy, CancellationToken token)
+        {
+            if (string.IsNullOrEmpty(tekst)) return string.Empty;
+
+            var skonsolidowane = new List<Zakres>();
+            if (zakresy != null && zakresy.Count > 0)
+            {
+                var posortowane = zakresy.Where(z => z.od < z.do_).OrderBy(z => z.od).ToList();
+                if (posortowane.Count > 0)
+                {
+                    Zakres aktualny = new Zakres { od = posortowane[0].od, do_ = posortowane[0].do_ };
+                    for (int i = 1; i < posortowane.Count; i++)
+                    {
+                        if (token.IsCancellationRequested) return null;
+                        if (posortowane[i].od <= aktualny.do_)
+                        {
+                            if (posortowane[i].do_ > aktualny.do_) aktualny.do_ = posortowane[i].do_;
+                        }
+                        else
+                        {
+                            skonsolidowane.Add(aktualny);
+                            aktualny = new Zakres { od = posortowane[i].od, do_ = posortowane[i].do_ };
+                        }
+                    }
+                    skonsolidowane.Add(aktualny);
+                }
+            }
+
+            StringBuilder sb = new StringBuilder();
+            sb.Append(@"{\rtf1\ansi\ansicpg1250\deff0\nouicompat{\fonttbl{\f0\fnil\fcharset238 Consolas;}}");
+            sb.Append(@"{\colortbl ;\red255\green235\blue80;}");
+            sb.Append(@"\viewkind4\uc1\f0\fs18 ");
+
+            int lastIdx = 0;
+            int textLen = tekst.Length;
+
+            foreach (var z in skonsolidowane)
+            {
+                if (token.IsCancellationRequested) return null;
+
+                int od = Math.Max(0, Math.Min(z.od, textLen));
+                int do_ = Math.Max(od, Math.Min(z.do_, textLen));
+
+                if (od > lastIdx) AppendEscapedRtf(sb, tekst, lastIdx, od);
+                if (do_ > od)
+                {
+                    sb.Append(@"\highlight1 ");
+                    AppendEscapedRtf(sb, tekst, od, do_);
+                    sb.Append(@"\highlight0 ");
+                }
+                lastIdx = do_;
+            }
+
+            if (lastIdx < textLen) AppendEscapedRtf(sb, tekst, lastIdx, textLen);
+
+            sb.Append("}");
+            return sb.ToString();
+        }
+
+        private void AppendEscapedRtf(StringBuilder sb, string text, int start, int end)
+        {
+            for (int i = start; i < end; i++)
+            {
+                char c = text[i];
+                switch (c)
+                {
+                    case '\\': sb.Append(@"\\"); break;
+                    case '{': sb.Append(@"\{"); break;
+                    case '}': sb.Append(@"\}"); break;
+                    case '\n': sb.Append(@"\par "); break;
+                    case '\r': break;
+                    default:
+                        if (c > 127) sb.Append(@"\u").Append((int)c).Append('?');
+                        else sb.Append(c);
+                        break;
+                }
+            }
+        }
+
+        // ── Główna analiza ────────────────────────────────────────────────────
         private async void btnAnalyzuj_Click(object sender, EventArgs e)
         {
             if (_wybranePliki.Count < 2)
             {
-                MessageBox.Show("Wybierz co najmniej 2 pliki!", "Brak plikow",
-                    MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                MessageBox.Show("Wybierz co najmniej 2 pliki!", "Brak plików", MessageBoxButtons.OK, MessageBoxIcon.Warning);
                 return;
             }
 
-            List<string> adresy = txtAdresy.Lines
-                .Select(l => l.Trim())
-                .Where(l => l.Length > 0)
-                .ToList();
-
+            var adresy = txtAdresy.Lines.Select(l => l.Trim()).Where(l => l.Length > 0).ToList();
             if (adresy.Count == 0)
             {
-                MessageBox.Show("Podaj co najmniej jeden adres serwera!", "Brak serwerow",
-                    MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                MessageBox.Show("Podaj co najmniej jeden adres serwera!", "Brak serwerów", MessageBoxButtons.OK, MessageBoxIcon.Warning);
                 return;
             }
 
             int n = (int)numN.Value;
-
-            int grainSize = (int)numGrainSize.Value;
             double prog = (double)numProg.Value;
-            int port = 8001;
+            int port = PortSerwera;
+            int sloty = SlotowNaSerwer;
 
-            var posortowane = _wybranePliki
-                .Where(f => File.Exists(f))
-                .OrderByDescending(f => new FileInfo(f).Length)
-                .ToList();
+            ResetPools();
 
+            var posortowane = _wybranePliki.Where(f => File.Exists(f)).OrderByDescending(f => new FileInfo(f).Length).ToList();
             var pary = GenerujPary(posortowane);
 
-            btnAnalyzuj.Enabled = false;
-            btnWybierzPliki.Enabled = false;
+            UstawTrybAnalizy(true);
             wczytaneWyniki.Clear();
             listPary.Items.Clear();
-
             stoper.Restart();
             timerInterfejsu.Start();
             _licznikZadan = -1;
+            _cts = new CancellationTokenSource();
+            var token = _cts.Token;
 
-            // ── FAZA 1: upload ────────────────────────────────────────────────
-            lblStatus.Text = "Faza 1/2: Przesylanie plikow na serwery...";
-
-            progressBar.Minimum = 0;
-            progressBar.Maximum = posortowane.Count * adresy.Count;
-            progressBar.Value = 0;
+            // FAZA 1: upload
+            SetStatus("Faza 1/2: Przesyłanie plików na serwery...", 0, posortowane.Count * adresy.Count);
 
             var fileIds = new Dictionary<string, Dictionary<string, string>>();
-
-            foreach (var adres in adresy)
-                fileIds[adres] = new Dictionary<string, string>();
+            foreach (var adres in adresy) fileIds[adres] = new Dictionary<string, string>();
 
             int uploadWykonane = 0;
             bool uploadOK = true;
 
-            await Task.Run(() =>
+            try
             {
-                var uploadTasks = new List<Task>();
-
-                foreach (var adres in adresy)
+                await Task.Run(() =>
                 {
-                    foreach (var sciezka in posortowane)
+                    var uploadTasks = new List<Task>();
+                    foreach (var adres in adresy)
                     {
-                        string adresLocal = adres;
-                        string sciezkaLocal = sciezka;
-
-                        uploadTasks.Add(Task.Run(() =>
+                        foreach (var sciezka in posortowane)
                         {
-                            string fileId = WyslijUpload(adresLocal, port, sciezkaLocal);
+                            if (token.IsCancellationRequested) break;
+                            string adresLocal = adres;
+                            string sciezkaLocal = sciezka;
 
-                            if (fileId == null)
+                            uploadTasks.Add(Task.Run(() =>
                             {
-                                uploadOK = false;
-                                ZapiszLog($"[UPLOAD BLAD] {adresLocal} - {Path.GetFileName(sciezkaLocal)}");
-                            }
-                            else
-                            {
-                                lock (fileIds)
-                                    fileIds[adresLocal][sciezkaLocal] = fileId;
-                            }
+                                if (token.IsCancellationRequested) return;
+                                string fileId = WyslijUpload(adresLocal, port, sciezkaLocal);
+                                if (fileId == null)
+                                {
+                                    uploadOK = false;
+                                    ZapiszLog($"[UPLOAD BLAD] {adresLocal} - {Path.GetFileName(sciezkaLocal)}");
+                                }
+                                else
+                                {
+                                    lock (fileIds) fileIds[adresLocal][sciezkaLocal] = fileId;
+                                }
 
-                            int done = Interlocked.Increment(ref uploadWykonane);
-                            BeginInvoke(new Action(() =>
-                            {
-                                progressBar.Value = Math.Min(done, progressBar.Maximum);
-                                lblStatus.Text = $"Faza 1/2: Przeslano {done}/{posortowane.Count * adresy.Count} plikow...";
-                            }));
-                        }));
+                                int done = Interlocked.Increment(ref uploadWykonane);
+                                BeginInvoke(new Action(() =>
+                                {
+                                    progressBar.Value = Math.Min(done, progressBar.Maximum);
+                                    lblStatus.Text = $"Faza 1/2: Przesłano {done}/{posortowane.Count * adresy.Count} plików...";
+                                }));
+                            }, token));
+                        }
                     }
-                }
-
-                var swFaza1 = System.Diagnostics.Stopwatch.StartNew();
-                Task.WaitAll(uploadTasks.ToArray());
-                swFaza1.Stop();
-                ZapiszLog($"[FAZA1] Upload: {swFaza1.ElapsedMilliseconds}ms ({posortowane.Count} plikow x {adresy.Count} serwerow)");
-            });
+                    Task.WaitAll(uploadTasks.ToArray());
+                }, token);
+            }
+            catch (OperationCanceledException) { FinalizujAnulowanie(); return; }
 
             if (!uploadOK)
-                MessageBox.Show(
-                    "Nie udalo sie przeslac niektorych plikow.\nSprawdz errors.log.",
-                    "Blad uploadu", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                MessageBox.Show("Nie udało się przesłać niektórych plików.\nSprawdź errors.log.", "Błąd uploadu", MessageBoxButtons.OK, MessageBoxIcon.Warning);
 
-            // ── FAZA 2: compare z connection pool ────────────────────────────
-            lblStatus.Text = "Faza 2/2: Porownywanie par...";
+            if (token.IsCancellationRequested) { FinalizujAnulowanie(); return; }
 
-            progressBar.Minimum = 0;
-            progressBar.Maximum = pary.Count;
-            progressBar.Value = 0;
+            // FAZA 2: compare
+            SetStatus("Faza 2/2: Porównywanie par...", 0, pary.Count);
 
             int wykonane = 0;
             var wynikiBag = new ConcurrentBag<WynikPary>();
-
             int liczbaSerwerow = adresy.Count;
 
-            await Task.Run(() =>
+            try
             {
-                int maxWatkow = Math.Min(liczbaSerwerow * SLOTOW_NA_SERWER, pary.Count);
-                var opcje = new ParallelOptions { MaxDegreeOfParallelism = maxWatkow };
-
-                var swFaza2 = System.Diagnostics.Stopwatch.StartNew();
-
-                Parallel.ForEach(pary, opcje, (para) =>
+                await Task.Run(() =>
                 {
-                    int idx = (int)((uint)Interlocked.Increment(ref _licznikZadan) % liczbaSerwerow);
+                    int maxWatkow = Math.Min(liczbaSerwerow * sloty, Math.Max(pary.Count, 1));
+                    var opcje = new ParallelOptions { MaxDegreeOfParallelism = maxWatkow, CancellationToken = token };
 
-                    var wynik = WyslijCompareFailover(
-                        adresy, fileIds, idx, port,
-                        para.Item1, para.Item2, n, grainSize);
-
-                    if (wynik != null)
-                        wynikiBag.Add(wynik);
-
-                    int done = Interlocked.Increment(ref wykonane);
-
-                    BeginInvoke(new Action(() =>
+                    Parallel.ForEach(pary, opcje, (para) =>
                     {
-                        progressBar.Value = Math.Min(done, pary.Count);
-                        lblStatus.Text = $"Faza 2/2: {Path.GetFileName(para.Item1)} vs {Path.GetFileName(para.Item2)}";
-                    }));
-                });
-                swFaza2.Stop();
-                ZapiszLog($"[FAZA2] Porownywanie {pary.Count} par: {swFaza2.ElapsedMilliseconds}ms ({liczbaSerwerow} serwerow, {maxWatkow} watkow)");
-            });
+                        int idx = (int)((uint)Interlocked.Increment(ref _licznikZadan) % liczbaSerwerow);
+                        var wynik = WyslijCompareFailover(adresy, fileIds, idx, port, para.Item1, para.Item2, n);
+                        if (wynik != null) wynikiBag.Add(wynik);
+
+                        int done = Interlocked.Increment(ref wykonane);
+                        BeginInvoke(new Action(() =>
+                        {
+                            progressBar.Value = Math.Min(done, pary.Count);
+                            lblStatus.Text = $"Faza 2/2: {Path.GetFileName(para.Item1)} vs {Path.GetFileName(para.Item2)}";
+                        }));
+                    });
+                }, token);
+            }
+            catch (OperationCanceledException) { FinalizujAnulowanie(); return; }
 
             stoper.Stop();
             timerInterfejsu.Stop();
-            lblTimer.Text = $"Czas calkowity: {stoper.Elapsed:hh\\:mm\\:ss}";
+            lblTimer.Text = $"Czas całkowity: {stoper.Elapsed:hh\\:mm\\:ss}";
 
             int oczekiwane = pary.Count;
             int otrzymane = wynikiBag.Count;
 
             if (oczekiwane != otrzymane)
-                MessageBox.Show(
-                    $"Oczekiwano: {oczekiwane}\nOtrzymano: {otrzymane}\n" +
-                    $"Nieudane: {oczekiwane - otrzymane}\n\nSprawdz errors.log.",
-                    "Uwaga - brakujace wyniki",
-                    MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                MessageBox.Show($"Oczekiwano: {oczekiwane}\nOtrzymano: {otrzymane}\nNieudane: {oczekiwane - otrzymane}\n\nSprawdź errors.log.", "Uwaga", MessageBoxButtons.OK, MessageBoxIcon.Warning);
 
-            wczytaneWyniki = wynikiBag
-                .OrderByDescending(w => w.jaccard)
-                .ToList();
-
+            wczytaneWyniki = wynikiBag.OrderByDescending(w => w.jaccard).ToList();
             OdswiezListe();
 
             int plagiatow = wczytaneWyniki.Count(w => w.jaccard >= prog);
-            lblStatus.Text = $"Gotowe! Przeanalizowano {wczytaneWyniki.Count} par." +
-                             (plagiatow > 0 ? $" Wykryto {plagiatow} plagiatow!" : "");
+            lblStatus.Text = $"Gotowe! Przeanalizowano {wczytaneWyniki.Count} par." + (plagiatow > 0 ? $"  Wykryto {plagiatow} plagiatów!" : "");
+            lblStatus.ForeColor = plagiatow > 0 ? Color.Firebrick : Color.DimGray;
 
-            btnAnalyzuj.Enabled = true;
-            btnWybierzPliki.Enabled = true;
+            UstawTrybAnalizy(false);
         }
 
-        // ── Upload (faza 1) ──────────────────────────────────────────────────
         private string WyslijUpload(string adres, int port, string sciezka)
         {
             try
@@ -381,29 +525,25 @@ namespace GUI
                 byte[] dane = File.ReadAllBytes(sciezka);
                 string nazwa = Path.GetFileName(sciezka);
 
-                using (TcpClient klient = new TcpClient())
+                using (var klient = new TcpClient())
                 {
                     klient.NoDelay = true;
-                    klient.ReceiveTimeout = TIMEOUT_MS;
-
-                    klient.SendTimeout = TIMEOUT_MS;
+                    klient.ReceiveTimeout = TimeoutMs;
+                    klient.SendTimeout = TimeoutMs;
                     klient.Connect(adres, port);
 
-                    using (NetworkStream stream = klient.GetStream())
-                    using (BinaryWriter writer = new BinaryWriter(stream))
-                    using (BinaryReader reader = new BinaryReader(stream))
+                    using (var stream = klient.GetStream())
+                    using (var writer = new BinaryWriter(stream))
+                    using (var reader = new BinaryReader(stream))
                     {
-
                         writer.Write((byte)0x01);
                         writer.Write(nazwa);
                         writer.Write((long)dane.Length);
 
                         int wyslane = 0;
-
                         while (wyslane < dane.Length)
                         {
                             int porcja = Math.Min(65536, dane.Length - wyslane);
-
                             writer.Write(dane, wyslane, porcja);
                             wyslane += porcja;
                         }
@@ -412,7 +552,6 @@ namespace GUI
                         string fileId = reader.ReadString();
                         bool wCache = reader.ReadBoolean();
                         return fileId;
-
                     }
                 }
             }
@@ -423,56 +562,37 @@ namespace GUI
             }
         }
 
-        // ── Compare z failoverem (faza 2) - WZBROJONY FAILOVER ───────────────
-        private WynikPary WyslijCompareFailover(
-            List<string> adresy,
-            Dictionary<string, Dictionary<string, string>> fileIds,
-            int startIdx, int port,
-            string plikA, string plikB, int n, int grainSize)
+        private WynikPary WyslijCompareFailover(List<string> adresy, Dictionary<string, Dictionary<string, string>> fileIds, int startIdx, int port, string plikA, string plikB, int n)
         {
-            // POPRAWKA: Próbujemy więcej razy, wliczając ponowne proby na tym samym serwerze.
-            // Zapewnia to tolerancję na przejściowe odrzucenia (reset połączenia) podczas piku zapytań.
             int maxProby = Math.Max(adresy.Count * 3, 5);
 
             for (int i = 0; i < maxProby; i++)
             {
+                if (_cts?.IsCancellationRequested == true) return null;
+
                 int aktIdx = (startIdx + i) % adresy.Count;
                 string adres = adresy[aktIdx];
 
-                if (!fileIds[adres].TryGetValue(plikA, out string idA) ||
-                    !fileIds[adres].TryGetValue(plikB, out string idB))
+                if (!fileIds[adres].TryGetValue(plikA, out string idA) || !fileIds[adres].TryGetValue(plikB, out string idB))
                 {
-                    ZapiszLog($"[FAILOVER] Serwer {adres} nie ma file_id dla " +
-                        $"{Path.GetFileName(plikA)} vs {Path.GetFileName(plikB)}. Probuje nastepny...");
+                    ZapiszLog($"[FAILOVER] Serwer {adres} nie ma file_id dla {Path.GetFileName(plikA)} vs {Path.GetFileName(plikB)}. Próbuję następny...");
                     continue;
                 }
 
-                var wynik = WyslijCompareZPuli(adres, port, idA, idB, plikA, plikB, n, grainSize);
-
+                var wynik = WyslijCompareZPuli(adres, port, idA, idB, plikA, plikB, n);
                 if (wynik != null) return wynik;
 
-                ZapiszLog($"[FAILOVER] COMPARE na {adres}:{port} zawiodlo (proba {i + 1}/{maxProby}). Probuje ponownie po przerwie...");
-
-                // BACKOFF: Daje serwerowi chwilę na oddech przed następną próbą wysłania zapytania
+                ZapiszLog($"[FAILOVER] COMPARE na {adres}:{port} zawiodło. Czekam...");
                 Thread.Sleep(300);
             }
-
-            ZapiszLog($"[BLAD] Wszystkie proby i serwery zawiodly dla " +
-                      $"{Path.GetFileName(plikA)} vs {Path.GetFileName(plikB)}.");
             return null;
         }
 
-        // ── Compare z connection pool ─────────────────────────────────────────
-        private WynikPary WyslijCompareZPuli(
-    string adres, int port,
-    string fileIdA, string fileIdB,
-    string plikA, string plikB,
-    int n, int grainSize)
+        private WynikPary WyslijCompareZPuli(string adres, int port, string fileIdA, string fileIdB, string plikA, string plikB, int n)
         {
             var pool = GetPool(adres, port);
             TcpClient klient = null;
             bool blad = false;
-
             var sw = System.Diagnostics.Stopwatch.StartNew();
 
             try
@@ -488,14 +608,13 @@ namespace GUI
                 writer.Write(fileIdA);
                 writer.Write(fileIdB);
                 writer.Write(n);
-                writer.Write(grainSize);
+                writer.Write(1); // grainSize (zabezpieczenie jeśli brakuje w numGrainSize Designerze)
                 writer.Flush();
 
                 double jaccard = reader.ReadDouble();
-
                 if (jaccard < 0)
                 {
-                    ZapiszLog($"[COMPARE ERROR] Serwer {adres} nie rozpoznal file_id.");
+                    ZapiszLog($"[COMPARE ERROR] Serwer {adres} nie rozpoznał file_id.");
                     blad = true;
                     return null;
                 }
@@ -505,22 +624,18 @@ namespace GUI
 
                 int liczbaZakresow1 = reader.ReadInt32();
                 var zakresy1 = new List<Zakres>(liczbaZakresow1);
-                for (int i = 0; i < liczbaZakresow1; i++)
-                    zakresy1.Add(new Zakres { od = reader.ReadInt32(), do_ = reader.ReadInt32() });
+                for (int i = 0; i < liczbaZakresow1; i++) zakresy1.Add(new Zakres { od = reader.ReadInt32(), do_ = reader.ReadInt32() });
 
                 int liczbaZakresow2 = reader.ReadInt32();
                 var zakresy2 = new List<Zakres>(liczbaZakresow2);
-                for (int i = 0; i < liczbaZakresow2; i++)
-                    zakresy2.Add(new Zakres { od = reader.ReadInt32(), do_ = reader.ReadInt32() });
+                for (int i = 0; i < liczbaZakresow2; i++) zakresy2.Add(new Zakres { od = reader.ReadInt32(), do_ = reader.ReadInt32() });
 
                 string csv = reader.ReadString();
                 string json = reader.ReadString();
-                long czasSerwera = reader.ReadInt64(); // tylko raz
+                long czasSerwera = reader.ReadInt64();
 
                 sw.Stop();
-                ZapiszLog($"[TIMING] {Path.GetFileName(plikA)} vs {Path.GetFileName(plikB)} @ {adres} — " +
-                          $"connect: {swConnect}ms, caly request: {sw.ElapsedMilliseconds}ms, " +
-                          $"obliczenia serwera: {czasSerwera}ms, overhead sieciowy: {sw.ElapsedMilliseconds - czasSerwera}ms");
+                ZapiszLog($"[TIMING] {Path.GetFileName(plikA)} vs {Path.GetFileName(plikB)} @ {adres} — connect: {swConnect}ms, całość: {sw.ElapsedMilliseconds}ms, serwer: {czasSerwera}ms");
 
                 ZapiszCSVLokalnie(plikA, plikB, csv);
                 ZapiszJSONLokalnie(plikA, plikB, json);
@@ -539,208 +654,84 @@ namespace GUI
             catch (SocketException ex) { blad = true; ZapiszLog($"[SOCKET ERROR] {adres}:{port} — {ex.Message}"); return null; }
             catch (IOException ex) { blad = true; ZapiszLog($"[IO ERROR] {adres}:{port} — {ex.Message}"); return null; }
             catch (Exception ex) { blad = true; ZapiszLog($"[ERROR] {adres}:{port} — {ex.Message}"); return null; }
-            finally
-            {
-                if (klient != null)
-                    pool.Return(klient, wasError: blad);
-            }
+            finally { if (klient != null) pool.Return(klient, wasError: blad); }
         }
 
-        // ── Generowanie par ──────────────────────────────────────────────────
         private List<(string, string)> GenerujPary(List<string> pliki)
         {
             var pary = new List<(string, string)>();
-
             for (int i = 0; i < pliki.Count; i++)
                 for (int j = i + 1; j < pliki.Count; j++)
                     pary.Add((pliki[i], pliki[j]));
-
             return pary;
         }
 
-        // ── Lista par ────────────────────────────────────────────────────────
         private void OdswiezListe()
         {
             listPary.BeginUpdate();
-
             listPary.Items.Clear();
-            foreach (var wynik in wczytaneWyniki)
-                listPary.Items.Add(
-                    Path.GetFileName(wynik.plikA) + " vs " + Path.GetFileName(wynik.plikB));
-
+            foreach (var wynik in wczytaneWyniki) listPary.Items.Add(Path.GetFileName(wynik.plikA) + " vs " + Path.GetFileName(wynik.plikB));
             listPary.EndUpdate();
+            lblLicznikPar.Text = $"Par: {wczytaneWyniki.Count}" + (wczytaneWyniki.Count > 0 ? $"  |  Plagiatów: {wczytaneWyniki.Count(w => w.jaccard >= (double)numProg.Value)}" : "");
         }
 
-        // ── Wybor pary ───────────────────────────────────────────────────────
-        private void ListPary_SelectedIndexChanged(object sender, EventArgs e)
+        // ── Wczytywanie wyników z folderu ─────────────────────────────────────
+        private async void btnWczytaj_Click(object sender, EventArgs e)
         {
-            int indeks = listPary.SelectedIndex;
-
-            if (indeks < 0 || indeks >= wczytaneWyniki.Count) return;
-
-            WynikPary wynik = wczytaneWyniki[indeks];
-
-            lblNazwaA.Text = Path.GetFileName(wynik.plikA) + $" (A→B: {wynik.aDoB:F2}%)";
-
-            lblNazwaB.Text = Path.GetFileName(wynik.plikB) + $" (B→A: {wynik.bDoA:F2}%)";
-
-            rtbPlikA.Text = "Wczytywanie...";
-            rtbPlikB.Text = "Wczytywanie...";
-
-            string sciezkaA = wynik.plikA;
-
-            string sciezkaB = wynik.plikB;
-            var zakresy1 = wynik.zakresy1;
-            var zakresy2 = wynik.zakresy2;
-
-            Task.Run(() =>
+            using (var dialog = new FolderBrowserDialog())
             {
-                string tekstA = WczytajTekstLokalnie(sciezkaA);
-                string tekstB = WczytajTekstLokalnie(sciezkaB);
+                dialog.Description = "Wybierz folder z wynikami (Raporty)";
+                if (dialog.ShowDialog() != DialogResult.OK) return;
 
-                this.Invoke((Action)(() =>
+                string folder = dialog.SelectedPath;
+                lblFolder.Text = folder;
+
+                UstawTrybAnalizy(true);
+                lblStatus.Text = "Wczytywanie wyników...";
+
+                var wyniki = new List<WynikPary>();
+                int bledy = 0;
+                string[] plikiJson = Directory.GetFiles(folder, "*.json");
+
+                if (plikiJson.Length == 0)
                 {
-
-                    rtbPlikA.Text = tekstA;
-                    rtbPlikB.Text = tekstB;
-                    PodswietlFragmenty(rtbPlikA, zakresy1);
-                    PodswietlFragmenty(rtbPlikB, zakresy2);
-                }));
-            });
-
-        }
-
-        private string WczytajTekstLokalnie(string sciezka)
-        {
-            try
-            {
-                if (File.Exists(sciezka))
-                    return File.ReadAllText(sciezka);
-
-                return $"[Plik niedostepny: {sciezka}]";
-            }
-            catch (Exception ex)
-            {
-                return $"[Blad odczytu: {ex.Message}]";
-
-            }
-        }
-
-        // ── Podswietlanie ────────────────────────────────────────────────────
-        private void PodswietlFragmenty(RichTextBox rtb, List<Zakres> zakresy)
-        {
-            SendMessage(rtb.Handle, WM_SETREDRAW, false, 0);
-
-            try
-            {
-                rtb.SelectAll();
-
-                rtb.SelectionBackColor = Color.White;
-
-                if (zakresy != null)
-                {
-                    foreach (var zakres in zakresy)
-                    {
-                        int od = zakres.od;
-
-                        int dlugosc = zakres.do_ - zakres.od;
-
-                        if (od < 0 || od >= rtb.TextLength) continue;
-
-                        if (od + dlugosc > rtb.TextLength)
-                            dlugosc = rtb.TextLength - od;
-
-                        if (dlugosc <= 0) continue;
-
-                        rtb.Select(od, dlugosc);
-                        rtb.SelectionBackColor = Color.Yellow;
-
-                    }
+                    MessageBox.Show("Nie znaleziono żadnych plików JSON w tym folderze!", "Brak wyników", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                    UstawTrybAnalizy(false);
+                    lblStatus.Text = "";
+                    return;
                 }
-                rtb.Select(0, 0);
 
-            }
-            finally
-            {
-                SendMessage(rtb.Handle, WM_SETREDRAW, true, 0);
-
-                rtb.Invalidate();
-            }
-        }
-
-        // ── Wczytywanie wynikow z folderu ────────────────────────────────────
-        private void btnWczytaj_Click(object sender, EventArgs e)
-        {
-            FolderBrowserDialog dialog = new FolderBrowserDialog();
-
-            dialog.Description = "Wybierz folder z wynikami (Raporty)";
-
-            if (dialog.ShowDialog() != DialogResult.OK) return;
-
-            string folder = dialog.SelectedPath;
-            lblFolder.Text = folder;
-
-            wczytaneWyniki.Clear();
-
-            listPary.Items.Clear();
-
-            string[] plikiJson = Directory.GetFiles(folder, "*.json");
-
-            if (plikiJson.Length == 0)
-            {
-                MessageBox.Show("Nie znaleziono zadnych plikow JSON w tym folderze!",
-                    "Brak wynikow", MessageBoxButtons.OK, MessageBoxIcon.Information);
-
-                return;
-            }
-
-            int bledy = 0;
-
-            foreach (string plikJson in plikiJson)
-            {
-                try
+                await Task.Run(() =>
                 {
-                    string zawartosc = File.ReadAllText(plikJson);
-
-                    WynikPary wynik = JsonConvert.DeserializeObject<WynikPary>(zawartosc);
-
-                    if (wynik == null || wynik.plikA == null || wynik.plikB == null)
+                    foreach (string plikJson in plikiJson)
                     {
-                        bledy++;
-
-                        continue;
+                        try
+                        {
+                            string zawartosc = File.ReadAllText(plikJson);
+                            WynikPary wynik = JsonConvert.DeserializeObject<WynikPary>(zawartosc);
+                            if (wynik?.plikA != null && wynik?.plikB != null) wyniki.Add(wynik);
+                            else bledy++;
+                        }
+                        catch { bledy++; }
                     }
-                    wczytaneWyniki.Add(wynik);
+                    wyniki.Sort((a, b) => b.jaccard.CompareTo(a.jaccard));
+                });
 
-                }
-                catch { bledy++; }
+                wczytaneWyniki = wyniki;
+                OdswiezListe();
+                UstawTrybAnalizy(false);
+                lblStatus.Text = $"Wczytano {wczytaneWyniki.Count} wyników." + (bledy > 0 ? $"  Pominięto {bledy} uszkodzonych." : "");
             }
-
-            wczytaneWyniki.Sort((a, b) => b.jaccard.CompareTo(a.jaccard));
-
-            OdswiezListe();
-
-            string komunikat = $"Wczytano {wczytaneWyniki.Count} wynikow.";
-            if (bledy > 0) komunikat += $"\nPominieto {bledy} uszkodzonych plikow.";
-
-            MessageBox.Show(komunikat, "Wczytywanie zakonczone",
-                MessageBoxButtons.OK, MessageBoxIcon.Information);
-
         }
 
-        // ── Zapis CSV / JSON ─────────────────────────────────────────────────
+        // ── Zapisywanie logów i raportów ─────────────────────────────────────
         private void ZapiszCSVLokalnie(string plikA, string plikB, string csv)
         {
             try
             {
                 Directory.CreateDirectory("Raporty");
-
                 string suffix = Guid.NewGuid().ToString("N").Substring(0, 4);
-                string path = Path.Combine("Raporty",
-                    $"{Path.GetFileNameWithoutExtension(plikA)}_VS_" +
-                    $"{Path.GetFileNameWithoutExtension(plikB)}_" +
-                    $"{DateTime.Now:yyyyMMdd_HHmmss}_{suffix}.csv");
-
+                string path = Path.Combine("Raporty", $"{Path.GetFileNameWithoutExtension(plikA)}_VS_{Path.GetFileNameWithoutExtension(plikB)}_{DateTime.Now:yyyyMMdd_HHmmss}_{suffix}.csv");
                 lock (_plikLock) File.WriteAllText(path, csv);
             }
             catch { }
@@ -751,29 +742,21 @@ namespace GUI
             try
             {
                 Directory.CreateDirectory("Raporty");
-
                 string suffix = Guid.NewGuid().ToString("N").Substring(0, 4);
-                string path = Path.Combine("Raporty",
-                    $"{Path.GetFileNameWithoutExtension(plikA)}_VS_" +
-                    $"{Path.GetFileNameWithoutExtension(plikB)}_" +
-                    $"{DateTime.Now:yyyyMMdd_HHmmss}_{suffix}.json");
-
+                string path = Path.Combine("Raporty", $"{Path.GetFileNameWithoutExtension(plikA)}_VS_{Path.GetFileNameWithoutExtension(plikB)}_{DateTime.Now:yyyyMMdd_HHmmss}_{suffix}.json");
                 lock (_plikLock) File.WriteAllText(path, json);
             }
             catch { }
         }
 
-        // ── Logi ──────────────────────────────────────────────────────────────
         private void ZapiszLog(string komunikat)
         {
             try
             {
                 Directory.CreateDirectory("Raporty");
-
                 string plik = Path.Combine("Raporty", "errors.log");
                 string linia = $"{DateTime.Now:yyyy-MM-dd HH:mm:ss} {komunikat}";
                 lock (_logLock) File.AppendAllText(plik, linia + Environment.NewLine);
-
             }
             catch { }
         }
