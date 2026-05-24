@@ -13,8 +13,8 @@
 
         private void InitializeComponent()
         {
-            // Kontrolki
             this.panelLewy = new System.Windows.Forms.Panel();
+            this.splitPorownanie = new System.Windows.Forms.SplitContainer();
             this.panelPlikA = new System.Windows.Forms.Panel();
             this.panelPlikB = new System.Windows.Forms.Panel();
 
@@ -26,7 +26,6 @@
 
             this.lblSeparator1 = new System.Windows.Forms.Label();
 
-            // Parametry analizy
             this.lblN = new System.Windows.Forms.Label();
             this.numN = new System.Windows.Forms.NumericUpDown();
             this.lblProg = new System.Windows.Forms.Label();
@@ -34,7 +33,6 @@
 
             this.lblSeparator2 = new System.Windows.Forms.Label();
 
-            // Parametry zaawansowane
             this.lblSloty = new System.Windows.Forms.Label();
             this.numSloty = new System.Windows.Forms.NumericUpDown();
             this.lblTimeout = new System.Windows.Forms.Label();
@@ -64,14 +62,21 @@
             this.lblNazwaB = new System.Windows.Forms.Label();
             this.rtbPlikB = new System.Windows.Forms.RichTextBox();
 
+            this.tabGlowny = new System.Windows.Forms.TabControl();
+            this.tabPorownanie = new System.Windows.Forms.TabPage();
+            this.tabHeatmapa = new System.Windows.Forms.TabPage();
+            this.panelHeatmapa = new System.Windows.Forms.Panel();
+            this.lblHeatmapaInfo = new System.Windows.Forms.Label();
+
             ((System.ComponentModel.ISupportInitialize)(this.numN)).BeginInit();
             ((System.ComponentModel.ISupportInitialize)(this.numProg)).BeginInit();
             ((System.ComponentModel.ISupportInitialize)(this.numSloty)).BeginInit();
             ((System.ComponentModel.ISupportInitialize)(this.numTimeout)).BeginInit();
             ((System.ComponentModel.ISupportInitialize)(this.numPort)).BeginInit();
+            ((System.ComponentModel.ISupportInitialize)(this.splitPorownanie)).BeginInit();
+            this.splitPorownanie.Panel1.SuspendLayout();
+            this.splitPorownanie.Panel2.SuspendLayout();
             this.panelLewy.SuspendLayout();
-            this.panelPlikA.SuspendLayout();
-            this.panelPlikB.SuspendLayout();
             this.SuspendLayout();
 
             // ── Kolory motywu ────────────────────────────────────────────────
@@ -86,7 +91,7 @@
             var fontMono = new System.Drawing.Font("Consolas", 9f);
 
             // ================================================================
-            // PANEL LEWY (szerokość 230px)
+            // PANEL LEWY (232px)
             // ================================================================
             this.panelLewy.Location = new System.Drawing.Point(0, 0);
             this.panelLewy.Size = new System.Drawing.Size(232, 620);
@@ -96,11 +101,10 @@
             this.panelLewy.BackColor = clrPanel;
             this.panelLewy.Name = "panelLewy";
 
-            int lx = 10; // lewy margines wewnątrz panelu
-            int lw = 210; // szerokość kontrolek
-            int cy = 8;  // bieżąca pozycja Y
+            int lx = 10;
+            int lw = 210;
+            int cy = 8;
 
-            // --- Wybór plików ---
             this.btnWybierzPliki.Location = new System.Drawing.Point(lx, cy);
             this.btnWybierzPliki.Size = new System.Drawing.Size(lw, 28);
             this.btnWybierzPliki.Text = "📂  Wybierz pliki do analizy...";
@@ -116,7 +120,6 @@
             this.lblWybranePliki.ForeColor = clrSubLabel;
 
             cy += 22;
-            // --- Serwery ---
             this.lblAdresy.Location = new System.Drawing.Point(lx, cy);
             this.lblAdresy.Size = new System.Drawing.Size(lw, 16);
             this.lblAdresy.Text = "Adresy serwerów (jeden na linię):";
@@ -133,13 +136,11 @@
             this.txtAdresy.BorderStyle = System.Windows.Forms.BorderStyle.FixedSingle;
 
             cy += 62;
-            // ── Separator ──
             this.lblSeparator1.Location = new System.Drawing.Point(lx, cy);
             this.lblSeparator1.Size = new System.Drawing.Size(lw, 1);
             this.lblSeparator1.BackColor = clrSep;
 
             cy += 7;
-            // --- Parametry analizy ---
             var lblParTitle = new System.Windows.Forms.Label();
             lblParTitle.Location = new System.Drawing.Point(lx, cy);
             lblParTitle.Size = new System.Drawing.Size(lw, 16);
@@ -178,13 +179,11 @@
             this.numProg.Font = fontUI;
 
             cy += 30;
-            // ── Separator ──
             this.lblSeparator2.Location = new System.Drawing.Point(lx, cy);
             this.lblSeparator2.Size = new System.Drawing.Size(lw, 1);
             this.lblSeparator2.BackColor = clrSep;
 
             cy += 7;
-            // --- Parametry zaawansowane ---
             var lblAdvTitle = new System.Windows.Forms.Label();
             lblAdvTitle.Location = new System.Drawing.Point(lx, cy);
             lblAdvTitle.Size = new System.Drawing.Size(lw, 16);
@@ -236,13 +235,11 @@
             this.numPort.Font = fontUI;
 
             cy += 30;
-            // ── Separator ──
             this.lblSeparator3.Location = new System.Drawing.Point(lx, cy);
             this.lblSeparator3.Size = new System.Drawing.Size(lw, 1);
             this.lblSeparator3.BackColor = clrSep;
 
             cy += 8;
-            // --- Przycisk Analizuj ---
             this.btnAnalyzuj.Location = new System.Drawing.Point(lx, cy);
             this.btnAnalyzuj.Size = new System.Drawing.Size(lw, 32);
             this.btnAnalyzuj.Text = "▶  Analizuj";
@@ -286,13 +283,11 @@
             this.lblTimer.ForeColor = clrLabel;
 
             cy += 24;
-            // ── Separator ──
             this.lblSeparator4.Location = new System.Drawing.Point(lx, cy);
             this.lblSeparator4.Size = new System.Drawing.Size(lw, 1);
             this.lblSeparator4.BackColor = clrSep;
 
             cy += 8;
-            // --- Wczytaj z folderu ---
             this.lblFolder.Location = new System.Drawing.Point(lx, cy);
             this.lblFolder.Size = new System.Drawing.Size(lw, 16);
             this.lblFolder.Text = "Nie wybrano folderu";
@@ -308,7 +303,6 @@
             this.btnWczytaj.Click += new System.EventHandler(this.btnWczytaj_Click);
 
             cy += 32;
-            // --- Lista par ---
             this.lblPary.Location = new System.Drawing.Point(lx, cy);
             this.lblPary.Size = new System.Drawing.Size(80, 16);
             this.lblPary.Text = "Lista par:";
@@ -323,7 +317,7 @@
 
             cy += 18;
             this.listPary.Location = new System.Drawing.Point(lx, cy);
-            this.listPary.Size = new System.Drawing.Size(lw, 0); // wysokość dynamicznie
+            this.listPary.Size = new System.Drawing.Size(lw, 0);
             this.listPary.Anchor = System.Windows.Forms.AnchorStyles.Top
                                             | System.Windows.Forms.AnchorStyles.Bottom
                                             | System.Windows.Forms.AnchorStyles.Left;
@@ -332,7 +326,7 @@
             this.listPary.Font = fontSmall;
             this.listPary.BorderStyle = System.Windows.Forms.BorderStyle.FixedSingle;
 
-            // ── Panel lewy — dodaj wszystkie kontrolki ───────────────────────
+            // Panel lewy — dodaj kontrolki
             this.panelLewy.Controls.Add(this.btnWybierzPliki);
             this.panelLewy.Controls.Add(this.lblWybranePliki);
             this.panelLewy.Controls.Add(this.lblAdresy);
@@ -365,18 +359,13 @@
             this.panelLewy.Controls.Add(this.listPary);
 
             // ================================================================
-            // PANEL PLIK A
+            // PANEL PLIK A — w Panel1 splittera
             // ================================================================
-            this.panelPlikA.Location = new System.Drawing.Point(234, 0);
-            this.panelPlikA.Size = new System.Drawing.Size(390, 620);
-            this.panelPlikA.Anchor = System.Windows.Forms.AnchorStyles.Top
-                                      | System.Windows.Forms.AnchorStyles.Bottom
-                                      | System.Windows.Forms.AnchorStyles.Left
-                                      | System.Windows.Forms.AnchorStyles.Right;
+            this.panelPlikA.Dock = System.Windows.Forms.DockStyle.Fill;
             this.panelPlikA.BackColor = System.Drawing.Color.White;
 
             this.lblNazwaA.Location = new System.Drawing.Point(4, 4);
-            this.lblNazwaA.Size = new System.Drawing.Size(382, 18);
+            this.lblNazwaA.Size = new System.Drawing.Size(400, 18);
             this.lblNazwaA.Text = "Plik A";
             this.lblNazwaA.Font = fontBold;
             this.lblNazwaA.ForeColor = clrLabel;
@@ -385,11 +374,10 @@
                                      | System.Windows.Forms.AnchorStyles.Right;
 
             this.rtbPlikA.Location = new System.Drawing.Point(4, 26);
-            this.rtbPlikA.Size = new System.Drawing.Size(382, 590);
             this.rtbPlikA.Anchor = System.Windows.Forms.AnchorStyles.Top
-                                     | System.Windows.Forms.AnchorStyles.Bottom
-                                     | System.Windows.Forms.AnchorStyles.Left
-                                     | System.Windows.Forms.AnchorStyles.Right;
+                                      | System.Windows.Forms.AnchorStyles.Bottom
+                                      | System.Windows.Forms.AnchorStyles.Left
+                                      | System.Windows.Forms.AnchorStyles.Right;
             this.rtbPlikA.Font = fontMono;
             this.rtbPlikA.BorderStyle = System.Windows.Forms.BorderStyle.None;
             this.rtbPlikA.ReadOnly = true;
@@ -400,17 +388,13 @@
             this.panelPlikA.Controls.Add(this.rtbPlikA);
 
             // ================================================================
-            // PANEL PLIK B
+            // PANEL PLIK B — w Panel2 splittera
             // ================================================================
-            this.panelPlikB.Location = new System.Drawing.Point(628, 0);
-            this.panelPlikB.Size = new System.Drawing.Size(390, 620);
-            this.panelPlikB.Anchor = System.Windows.Forms.AnchorStyles.Top
-                                      | System.Windows.Forms.AnchorStyles.Bottom
-                                      | System.Windows.Forms.AnchorStyles.Right;
+            this.panelPlikB.Dock = System.Windows.Forms.DockStyle.Fill;
             this.panelPlikB.BackColor = System.Drawing.Color.White;
 
             this.lblNazwaB.Location = new System.Drawing.Point(4, 4);
-            this.lblNazwaB.Size = new System.Drawing.Size(382, 18);
+            this.lblNazwaB.Size = new System.Drawing.Size(400, 18);
             this.lblNazwaB.Text = "Plik B";
             this.lblNazwaB.Font = fontBold;
             this.lblNazwaB.ForeColor = clrLabel;
@@ -419,11 +403,10 @@
                                      | System.Windows.Forms.AnchorStyles.Right;
 
             this.rtbPlikB.Location = new System.Drawing.Point(4, 26);
-            this.rtbPlikB.Size = new System.Drawing.Size(382, 590);
             this.rtbPlikB.Anchor = System.Windows.Forms.AnchorStyles.Top
-                                     | System.Windows.Forms.AnchorStyles.Bottom
-                                     | System.Windows.Forms.AnchorStyles.Left
-                                     | System.Windows.Forms.AnchorStyles.Right;
+                                      | System.Windows.Forms.AnchorStyles.Bottom
+                                      | System.Windows.Forms.AnchorStyles.Left
+                                      | System.Windows.Forms.AnchorStyles.Right;
             this.rtbPlikB.Font = fontMono;
             this.rtbPlikB.BorderStyle = System.Windows.Forms.BorderStyle.None;
             this.rtbPlikB.ReadOnly = true;
@@ -434,6 +417,55 @@
             this.panelPlikB.Controls.Add(this.rtbPlikB);
 
             // ================================================================
+            // SPLIT CONTAINER — dzieli zakładkę na pół
+            // ================================================================
+            this.splitPorownanie.Dock = System.Windows.Forms.DockStyle.Fill;
+            this.splitPorownanie.Orientation = System.Windows.Forms.Orientation.Vertical;
+            this.splitPorownanie.IsSplitterFixed = false;
+            this.splitPorownanie.SplitterWidth = 4;
+            this.splitPorownanie.BackColor = System.Drawing.Color.FromArgb(210, 215, 225);
+            this.splitPorownanie.Panel1.Controls.Add(this.panelPlikA);
+            this.splitPorownanie.Panel2.Controls.Add(this.panelPlikB);
+
+            // ================================================================
+            // TAB PORÓWNANIE
+            // ================================================================
+            this.tabPorownanie.Text = "Porównanie par";
+            this.tabPorownanie.BackColor = System.Drawing.Color.White;
+            this.tabPorownanie.Controls.Add(this.splitPorownanie);
+
+            // ================================================================
+            // TAB HEATMAPA
+            // ================================================================
+            this.lblHeatmapaInfo.Text = "Uruchom analizę aby zobaczyć macierz podobieństwa.";
+            this.lblHeatmapaInfo.Font = fontUI;
+            this.lblHeatmapaInfo.ForeColor = clrSubLabel;
+            this.lblHeatmapaInfo.AutoSize = true;
+            this.lblHeatmapaInfo.Location = new System.Drawing.Point(20, 20);
+
+            this.panelHeatmapa.Dock = System.Windows.Forms.DockStyle.Fill;
+            this.panelHeatmapa.BackColor = System.Drawing.Color.White;
+            this.panelHeatmapa.AutoScroll = true;
+            this.panelHeatmapa.Controls.Add(this.lblHeatmapaInfo);
+
+            this.tabHeatmapa.Text = "Macierz podobieństwa";
+            this.tabHeatmapa.BackColor = System.Drawing.Color.White;
+            this.tabHeatmapa.Controls.Add(this.panelHeatmapa);
+
+            // ================================================================
+            // TAB CONTROL
+            // ================================================================
+            this.tabGlowny.Location = new System.Drawing.Point(234, 0);
+            this.tabGlowny.Size = new System.Drawing.Size(786, 620);
+            this.tabGlowny.Anchor = System.Windows.Forms.AnchorStyles.Top
+                                    | System.Windows.Forms.AnchorStyles.Bottom
+                                    | System.Windows.Forms.AnchorStyles.Left
+                                    | System.Windows.Forms.AnchorStyles.Right;
+            this.tabGlowny.Font = fontUI;
+            this.tabGlowny.TabPages.Add(this.tabPorownanie);
+            this.tabGlowny.TabPages.Add(this.tabHeatmapa);
+
+            // ================================================================
             // Form1
             // ================================================================
             ((System.ComponentModel.ISupportInitialize)(this.numN)).EndInit();
@@ -441,9 +473,10 @@
             ((System.ComponentModel.ISupportInitialize)(this.numSloty)).EndInit();
             ((System.ComponentModel.ISupportInitialize)(this.numTimeout)).EndInit();
             ((System.ComponentModel.ISupportInitialize)(this.numPort)).EndInit();
+            ((System.ComponentModel.ISupportInitialize)(this.splitPorownanie)).EndInit();
+            this.splitPorownanie.Panel1.ResumeLayout(false);
+            this.splitPorownanie.Panel2.ResumeLayout(false);
             this.panelLewy.ResumeLayout(false);
-            this.panelPlikA.ResumeLayout(false);
-            this.panelPlikB.ResumeLayout(false);
 
             this.AutoScaleDimensions = new System.Drawing.SizeF(6F, 13F);
             this.AutoScaleMode = System.Windows.Forms.AutoScaleMode.Font;
@@ -454,15 +487,28 @@
             this.BackColor = System.Drawing.Color.FromArgb(228, 232, 240);
 
             this.Controls.Add(this.panelLewy);
-            this.Controls.Add(this.panelPlikA);
-            this.Controls.Add(this.panelPlikB);
+            this.Controls.Add(this.tabGlowny);
 
             this.ResumeLayout(false);
             this.PerformLayout();
+
+            // Ustaw splitter na 50% po załadowaniu formy
+            this.Load += (s, e) =>
+            {
+                splitPorownanie.SplitterDistance = splitPorownanie.Width / 2;
+                // rtbPlikA/B nie mają Size — niech Anchor zadba o rozmiar
+                rtbPlikA.Size = new System.Drawing.Size(
+                    splitPorownanie.Panel1.Width - 8,
+                    splitPorownanie.Panel1.Height - 30);
+                rtbPlikB.Size = new System.Drawing.Size(
+                    splitPorownanie.Panel2.Width - 8,
+                    splitPorownanie.Panel2.Height - 30);
+            };
         }
 
         // ── Deklaracje pól ───────────────────────────────────────────────────
         private System.Windows.Forms.Panel panelLewy;
+        private System.Windows.Forms.SplitContainer splitPorownanie;
         private System.Windows.Forms.Panel panelPlikA;
         private System.Windows.Forms.Panel panelPlikB;
 
@@ -506,5 +552,11 @@
         private System.Windows.Forms.RichTextBox rtbPlikA;
         private System.Windows.Forms.Label lblNazwaB;
         private System.Windows.Forms.RichTextBox rtbPlikB;
+
+        private System.Windows.Forms.TabControl tabGlowny;
+        private System.Windows.Forms.TabPage tabPorownanie;
+        private System.Windows.Forms.TabPage tabHeatmapa;
+        private System.Windows.Forms.Panel panelHeatmapa;
+        private System.Windows.Forms.Label lblHeatmapaInfo;
     }
 }
